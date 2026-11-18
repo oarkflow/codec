@@ -9,12 +9,14 @@ import (
 )
 
 type enc struct {
-	buf  []byte
-	w    int
-	max  uint64
-	fail bool
-	err  error
-	sc   *scratch
+	depth  int // struct nesting, bounded by maxDepth so cyclic data fails instead of overflowing the stack
+	vdepth int // value recursion (slices of slices, pointers...), bounded too
+	buf    []byte
+	w      int
+	max    uint64
+	fail   bool
+	err    error
+	sc     *scratch
 }
 
 func (e *enc) setErr(err error) {
@@ -151,7 +153,24 @@ func (e *enc) putOff(pos, v int) {
 	}
 }
 
+// frame encodes one struct. Its recursion, and value's, is bounded: data with
+// cycles (a pointer chain that loops back) has no finite encoding, and must
+// produce ErrTooDeep rather than overflow the stack. Once an error is set every
+// call returns at once, so a cycle that fans out cannot take exponential time.
 func (e *enc) frame(n *node, p unsafe.Pointer) {
+	if e.err != nil {
+		return
+	}
+	if e.depth++; e.depth > maxDepth {
+		e.setErr(ErrTooDeep)
+		e.depth--
+		return
+	}
+	e.frame0(n, p)
+	e.depth--
+}
+
+func (e *enc) frame0(n *node, p unsafe.Pointer) {
 	start := len(e.buf)
 	e.grow(n.nbm)
 	nv := 0
@@ -228,6 +247,24 @@ func (e *enc) frame(n *node, p unsafe.Pointer) {
 
 // value encodes the payload of a value at p as a standalone span.
 func (e *enc) value(n *node, p unsafe.Pointer) {
+	switch n.kind {
+	case kString, kBin, kBool, kInt, kUint, kF32, kF64: // cannot recurse: no guard needed
+		e.value0(n, p)
+		return
+	}
+	if e.err != nil {
+		return
+	}
+	if e.vdepth++; e.vdepth > 4*maxDepth {
+		e.setErr(ErrTooDeep)
+		e.vdepth--
+		return
+	}
+	e.value0(n, p)
+	e.vdepth--
+}
+
+func (e *enc) value0(n *node, p unsafe.Pointer) {
 	switch n.kind {
 	case kBool:
 		if *(*bool)(p) {

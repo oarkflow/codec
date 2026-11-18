@@ -118,7 +118,7 @@ var (
 
 const (
 	headerLen    = 5
-	maxDepth     = 512
+	maxDepth     = 4096 // nesting limit: far beyond real data, far below stack limits
 	hdrEvolvable = 0x04 // header flag: the message carries its struct field counts
 )
 
@@ -526,7 +526,7 @@ func target(v any) (*plan, unsafe.Pointer, error) {
 		if rv.IsNil() {
 			rv = reflect.New(rv.Type().Elem()).Elem() // nil pointer encodes as the zero value
 			last = rv.Addr()
-			break
+			continue // of its fully dereferenced type, as Unmarshal expects
 		}
 		last = rv
 		rv = rv.Elem()

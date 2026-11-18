@@ -482,6 +482,12 @@ func (e *tenc) fields(v reflect.Value, tt *ttype, dyn, force bool, depth int) (b
 				return err == nil, err
 			}
 		}
+		if len(tt.fields) > 0 { // no simple field: `Path.First ~` still creates the struct
+			n := e.pushB(tt.fields[0].key)
+			e.null("~")
+			e.pop(n)
+			return true, nil
+		}
 	}
 	return printed, nil
 }
@@ -504,27 +510,25 @@ func (e *tenc) walk(v reflect.Value, tt *ttype, dyn bool, depth int) error {
 		if err != nil {
 			return err
 		}
-		if !printed && len(e.pre) > 0 {
+		if !printed {
 			switch {
-			case dyn && tt.kind == tkMap:
+			case dyn || (ptr && tt.kind == tkMap):
 				e.null("~map")
-			case dyn:
-				e.null("~map")
-			default:
+			case len(e.pre) > 0:
 				e.null("~")
 			}
 		}
 		return nil
 	case tkList:
 		if v.Len() == 0 {
-			if dyn {
+			if dyn || ptr { // an empty list, not "no list"
 				e.null("~list")
 			} else if len(e.pre) > 0 {
 				e.null("~")
 			}
 			return nil
 		}
-		if tt.inline && !dyn && len(e.pre) > 0 {
+		if tt.inline && !dyn && len(e.pre) > 0 && !lonelyNil(v, tt) {
 			e.start()
 			if err := e.tokens(v, tt); err != nil {
 				return err
@@ -532,7 +536,18 @@ func (e *tenc) walk(v reflect.Value, tt *ttype, dyn bool, depth int) error {
 			e.b = append(e.b, '\n')
 			return nil
 		}
-		return e.items(v, tt, dyn, depth)
+		before := len(e.b)
+		if err := e.items(v, tt, dyn, depth); err != nil {
+			return err
+		}
+		if len(e.b) == before && len(e.pre) > 0 { // an array of zeros prints no items: keep the key
+			if ptr {
+				e.null("~list") // present, though zero
+			} else {
+				e.null("~")
+			}
+		}
+		return nil
 	}
 	e.start()
 	if err := e.scalar(v, tt, dyn, qWhole); err != nil {
@@ -553,7 +568,7 @@ func (e *tenc) items(v reflect.Value, tt *ttype, dyn bool, depth int) error {
 		}
 		var n int
 		if arr {
-			if !null && ev.IsZero() {
+			if v.Index(i).IsZero() { // an interface{} holding false or "" is not zero: it is non-nil
 				continue
 			}
 			var num [20]byte
@@ -566,7 +581,7 @@ func (e *tenc) items(v reflect.Value, tt *ttype, dyn bool, depth int) error {
 			e.null("~")
 			e.pop(n)
 		case et.kind == tkStruct || et.kind == tkMap:
-			if edyn && et.kind == tkMap && ev.Len() == 0 {
+			if et.kind == tkMap && ev.Len() == 0 && (edyn || ptr) {
 				e.null("~map")
 				e.pop(n)
 				continue
@@ -585,8 +600,13 @@ func (e *tenc) items(v reflect.Value, tt *ttype, dyn bool, depth int) error {
 				return err
 			}
 		case et.kind == tkList:
+			if ptr && et.array && ev.IsZero() { // a present array of zeros prints no items of its own
+				e.null("~list")
+				e.pop(n)
+				continue
+			}
 			if ev.Len() == 0 {
-				if edyn {
+				if edyn || ptr {
 					e.null("~list")
 				} else if !arr {
 					e.marker()
@@ -594,7 +614,7 @@ func (e *tenc) items(v reflect.Value, tt *ttype, dyn bool, depth int) error {
 				e.pop(n)
 				continue
 			}
-			if et.inline && !edyn {
+			if et.inline && !edyn && !lonelyNil(ev, et) {
 				e.start()
 				if err := e.tokens(ev, et); err != nil {
 					return err
@@ -690,6 +710,9 @@ func (e *tenc) mapEntries(v reflect.Value, tt *ttype, dyn bool, depth int) error
 			return err
 		}
 		e.kb = ke.b
+		if tt.key.kind != tkString && tt.key.kind != tkText && strNeedsQuote(string(e.kb), false, qKey) {
+			e.kb = appendQuoted(nil, string(e.kb)) // 5 and 1.5 as keys: quoted, so they are not read as an index or a path
+		}
 		if kind != reflect.String && kind != reflect.Int && kind != reflect.Int8 && kind != reflect.Int16 && kind != reflect.Int32 &&
 			kind != reflect.Int64 && kind != reflect.Uint && kind != reflect.Uint8 && kind != reflect.Uint16 && kind != reflect.Uint32 &&
 			kind != reflect.Uint64 && kind != reflect.Uintptr && kind != reflect.Float32 && kind != reflect.Float64 {
@@ -725,6 +748,16 @@ func (e *tenc) mapEntries(v reflect.Value, tt *ttype, dyn bool, depth int) error
 	copy(e.b[start:], out)
 	e.scratch = out[:0]
 	return nil
+}
+
+// lonelyNil reports a one-element list whose element is nil: on one line that
+// would read `~`, which means "no list", so it is written as an item instead.
+func lonelyNil(v reflect.Value, tt *ttype) bool {
+	if v.Len() != 1 {
+		return false
+	}
+	_, _, _, null, _, _ := settle(v.Index(0), tt.elem, false)
+	return null
 }
 
 func zeroField(v reflect.Value) bool {

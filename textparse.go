@@ -636,6 +636,20 @@ func (d *tdec) value(v reflect.Value, tt *ttype, rest []byte, ln tline) error {
 		resetValue(v, tt) // zero, but keep reusable storage
 		return nil
 	}
+	if len(rest) >= 4 && rest[0] == '~' && tt.kind != tkAny { // ~list and ~map: empty, not nil
+		switch {
+		case tt.kind == tkList && string(rest) == "~list":
+			if tt.array {
+				v.SetZero()
+			} else {
+				v.Set(reflect.MakeSlice(tt.t, 0, 0))
+			}
+			return nil
+		case tt.kind == tkMap && string(rest) == "~map":
+			v.Set(reflect.MakeMap(tt.t))
+			return nil
+		}
+	}
 	return d.inline(v, tt, rest, ln)
 }
 
@@ -765,8 +779,24 @@ func parseIntTok(tok []byte) (int64, bool) {
 			return n, true
 		}
 	}
-	n, err := strconv.ParseInt(unsafeStr(tok), 0, 64)
+	n, err := strconv.ParseInt(unsafeStr(tok), numBase(tok), 64)
 	return n, err == nil
+}
+
+// numBase is 0 (take the base from a 0x / 0b / 0o prefix) when the number has
+// one, and 10 otherwise, so a leading zero (010) is the decimal ten, not octal.
+func numBase(tok []byte) int {
+	i := 0
+	if i < len(tok) && (tok[i] == '+' || tok[i] == '-') {
+		i++
+	}
+	if i+1 < len(tok) && tok[i] == '0' {
+		switch tok[i+1] {
+		case 'x', 'X', 'b', 'B', 'o', 'O':
+			return 0
+		}
+	}
+	return 10
 }
 
 func parseUintTok(tok []byte) (uint64, bool) {
@@ -784,7 +814,7 @@ func parseUintTok(tok []byte) (uint64, bool) {
 			return n, true
 		}
 	}
-	n, err := strconv.ParseUint(unsafeStr(tok), 0, 64)
+	n, err := strconv.ParseUint(unsafeStr(tok), numBase(tok), 64)
 	return n, err == nil
 }
 

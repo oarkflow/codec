@@ -387,6 +387,19 @@ func TestTextErrors(t *testing.T) {
 	}
 }
 
+func TestTextLeadingZerosAreDecimal(t *testing.T) {
+	for in, want := range map[string]int64{"010": 10, "0010": 10, "0x10": 16, "0b101": 5, "0o17": 15, "-007": -7, "0": 0, "0123456789012345678": 123456789012345678, "00000000000000000000010": 10} {
+		var n int64
+		if err := UnmarshalText([]byte(in), &n); err != nil || n != want {
+			t.Errorf("%q -> %d, %v; want %d", in, n, err, want)
+		}
+	}
+	var u uint64
+	if err := UnmarshalText([]byte("0000000000000000000010"), &u); err != nil || u != 10 {
+		t.Errorf("uint: %d %v", u, err)
+	}
+}
+
 func TestTextFloats(t *testing.T) {
 	for _, f := range []float64{0.5, 3, -7, 1e21, 1e-9, math.MaxFloat64, math.SmallestNonzeroFloat64, math.Inf(1), math.Inf(-1)} {
 		txt, _ := MarshalText(f)
