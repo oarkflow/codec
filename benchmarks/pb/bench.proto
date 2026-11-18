@@ -1,0 +1,15 @@
+syntax = "proto3";
+package pb;
+option go_package = "github.com/oarkflow/codec/benchmarks/pb";
+
+message Addr { string street = 1; uint32 zip = 2; }
+message Item { string sku = 1; int32 qty = 2; double price = 3; }
+message Doc {
+  int64 id = 1; string name = 2; uint32 age = 3; bool active = 4;
+  double score = 5; float ratio = 6; int32 delta = 7;
+  repeated string tags = 8; repeated int64 times = 9; repeated uint32 small = 10;
+  bytes raw = 11; repeated bool flags = 12; repeated double fs = 13;
+  Addr addr = 14; Addr home = 15; repeated Item items = 16;
+}
+message Point { int64 ts = 1; string host = 2; double val = 3; uint32 status = 4; }
+message Batch { string source = 1; repeated Point points = 2; }
