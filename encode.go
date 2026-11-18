@@ -48,17 +48,37 @@ func widthCode(w int) byte {
 func Marshal(v any) ([]byte, error) { return Append(nil, v) }
 
 // Append encodes v and appends the result to dst.
-func Append(dst []byte, v any) ([]byte, error) {
+func Append(dst []byte, v any) ([]byte, error) { return appendValue(dst, v, false) }
+
+// MarshalEvolvable is Marshal for data that will outlive the program version
+// that wrote it (files, databases, queues). The message also records how many
+// fields each struct had, so a later version of the type with fields added at
+// the end of its structs can still read it: the new fields come back as zero.
+// It costs one byte per struct type in the message (the header grows from 5
+// bytes to 6 + one byte per struct type), and the layout of the data itself
+// is unchanged.
+//
+// Evolution is append-only. Allowed: adding fields at the end of a struct, at
+// any nesting depth, including new nested struct types. Not allowed (reading
+// returns ErrSchemaMismatch): removing, reordering, renaming or retyping
+// fields, and reading a newer message with an older type. Unmarshal and View
+// read both plain and evolvable messages; plain ones need an exact schema match.
+func MarshalEvolvable(v any) ([]byte, error) { return AppendEvolvable(nil, v) }
+
+// AppendEvolvable is MarshalEvolvable appending to dst.
+func AppendEvolvable(dst []byte, v any) ([]byte, error) { return appendValue(dst, v, true) }
+
+func appendValue(dst []byte, v any, evolvable bool) ([]byte, error) {
 	pl, p, err := target(v)
 	if err != nil {
 		return nil, err
 	}
-	out, err := appendPlan(dst, pl, p)
+	out, err := appendPlan(dst, pl, p, evolvable)
 	runtime.KeepAlive(v)
 	return out, err
 }
 
-func appendPlan(dst []byte, pl *plan, p unsafe.Pointer) ([]byte, error) {
+func appendPlan(dst []byte, pl *plan, p unsafe.Pointer, evolvable bool) ([]byte, error) {
 	sc := scratchPool.Get().(*scratch)
 	defer scratchPool.Put(sc)
 	base := len(dst)
@@ -67,8 +87,17 @@ func appendPlan(dst []byte, pl *plan, p unsafe.Pointer) ([]byte, error) {
 	var e enc
 	for {
 		e = enc{buf: dst[:base], w: w, max: 1<<(8*uint(w)) - 1, sc: sc}
-		e.buf = append(e.buf, 0xC0|widthCode(w), 0, 0, 0, 0)
+		flag := byte(0)
+		if evolvable {
+			flag = hdrEvolvable
+		}
+		e.buf = append(e.buf, 0xC0|flag|widthCode(w), 0, 0, 0, 0)
 		binary.LittleEndian.PutUint32(e.buf[base+1:], pl.fp)
+		hl := headerLen
+		if evolvable {
+			e.buf = append(e.buf, pl.shape...)
+			hl += len(pl.shape)
+		}
 		e.frame(pl.root, p)
 		if e.err != nil {
 			return nil, e.err
@@ -85,7 +114,7 @@ func appendPlan(dst []byte, pl *plan, p unsafe.Pointer) ([]byte, error) {
 			}
 			continue
 		}
-		body := int64(len(e.buf) - base - headerLen)
+		body := int64(len(e.buf) - base - hl)
 		if need := widthFor(body); need < w && !shrunk {
 			w, shrunk = need, true
 			continue

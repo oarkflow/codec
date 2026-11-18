@@ -3,6 +3,8 @@ package codec
 import (
 	"math/rand"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -265,4 +267,70 @@ func FuzzUnmarshal(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestUnmarshalNoCopy(t *testing.T) {
+	in := sample()
+	b, _ := Marshal(&in)
+	var a, c Rich
+	if err := Unmarshal(b, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := UnmarshalNoCopy(b, &c); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a, c) {
+		t.Fatal("nocopy result differs from Unmarshal")
+	}
+	var v any = map[string]any{"n": int64(-5), "u": uint64(7), "f": 1.5, "s": "hi", "b": []byte("xy")}
+	bd, _ := Marshal(&v)
+	var out any
+	if err := Unmarshal(bd, &out); err != nil {
+		t.Fatal(err)
+	}
+	m := out.(map[string]any)
+	if m["n"] != int64(-5) || m["u"] != uint64(7) || m["f"] != 1.5 || m["s"] != "hi" {
+		t.Fatalf("dynamic boxing wrong: %#v", m)
+	}
+	runtime.GC()
+	if m["n"] != int64(-5) {
+		t.Fatal("boxed value corrupted after GC")
+	}
+}
+
+func FuzzUnmarshalNoCopy(f *testing.F) {
+	in := sample()
+	b, _ := Marshal(&in)
+	f.Add(b)
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var a, c Rich
+		ea := Unmarshal(data, &a)
+		ec := UnmarshalNoCopy(append([]byte(nil), data...), &c)
+		if (ea == nil) != (ec == nil) {
+			t.Fatalf("error mismatch: %v vs %v", ea, ec)
+		}
+	})
+}
+
+func TestBase64(t *testing.T) {
+	in := sample()
+	txt, err := MarshalBase64(&in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Rich
+	if err := UnmarshalBase64(append([]byte("  "), append(txt, '\n')...), &out); err != nil || !reflect.DeepEqual(in, out) {
+		t.Fatalf("base64 round trip: %v", err)
+	}
+	std := strings.NewReplacer("-", "+", "_", "/").Replace(string(txt))
+	for len(std)%4 != 0 {
+		std += "="
+	}
+	var out2 Rich
+	if err := UnmarshalBase64([]byte(std), &out2); err != nil || !reflect.DeepEqual(in, out2) {
+		t.Fatalf("standard base64: %v", err)
+	}
+	if UnmarshalBase64([]byte("!!notbase64"), &out) == nil {
+		t.Fatal("expected error")
+	}
 }

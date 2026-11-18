@@ -13,6 +13,10 @@ var MaxMessageSize = 1 << 28
 // An Encoder writes a stream of values to an io.Writer, each prefixed with
 // its length, like json.Encoder. It reuses one buffer between calls.
 type Encoder struct {
+	// Evolvable makes Encode write messages that later versions of the type
+	// can still read after fields are added (see MarshalEvolvable).
+	Evolvable bool
+
 	w   io.Writer
 	buf []byte
 }
@@ -26,7 +30,11 @@ func (e *Encoder) Encode(v any) error {
 	if cap(e.buf) < room {
 		e.buf = make([]byte, room, 512)
 	}
-	buf, err := Append(e.buf[:room], v)
+	append := Append
+	if e.Evolvable {
+		append = AppendEvolvable
+	}
+	buf, err := append(e.buf[:room], v)
 	if err != nil {
 		return err
 	}

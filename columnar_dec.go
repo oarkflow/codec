@@ -52,6 +52,11 @@ func (d *dec) columns(n *node, p unsafe.Pointer, b []byte, k, cnt int) error {
 	if err != nil {
 		return err
 	}
+	if el.extra != nil {
+		for j := 0; j < cnt; j++ {
+			zeroExtra(el, unsafe.Add(data, uintptr(j)*el.size))
+		}
+	}
 	any := false
 	for i := range el.fields {
 		s := d.off(b, k+i*d.w)

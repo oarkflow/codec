@@ -18,13 +18,40 @@
 //     nil, bool, int64, uint64, float64, string, []byte, []any, map[string]any
 //     and map[any]any. A struct inside an interface{} becomes a map.
 //   - Zero values are omitted (one bit each), so there is no omitempty.
-//     Unexported fields and fields tagged `codec:"-"` or `json:"-"` are skipped.
+//     Unexported fields and fields tagged `codec:"-"` are skipped; `codec:"name"`
+//     renames a field in the text form and in interface{} values.
 //   - Marshal sorts map output by key, so it is deterministic. A nil map, nil
 //     slice and nil pointer-free zero value decode as empty/zero.
 //   - Marshal(nil pointer) encodes the zero value of the pointee.
 //   - Unmarshal copies strings and bytes from the input. Existing pointers,
 //     slice storage and non-nil maps are reused; copy them before
 //     retaining an earlier decoded snapshot. Use View for zero-copy field access.
+//
+// # Schema evolution
+//
+// Plain messages (Marshal) carry a fingerprint of the whole schema and can only
+// be read by exactly the same type. Data that outlives one program version
+// (files, databases, queues) should be written with MarshalEvolvable instead.
+// Those messages also record how many fields each struct had, which lets a
+// later version of the type, with fields added at the end of its structs,
+// still read them: the added fields come back as zero.
+//
+//	type UserV1 struct { Name string; Age uint32 }
+//	type UserV2 struct { Name string; Age uint32; Email string; Tags []string } // appended
+//
+//	data, _ := codec.MarshalEvolvable(&UserV1{"Ada", 36})
+//	var u UserV2
+//	codec.Unmarshal(data, &u) // u.Email == "", u.Tags == nil
+//
+// Allowed at any nesting depth (structs inside slices, maps, pointers, arrays):
+// appending fields to a struct and introducing new struct types in them. Not
+// allowed, and reported as ErrSchemaMismatch: removing, reordering, renaming
+// or retyping fields, inserting a field before existing ones, and reading a
+// newer message with an older type (the error says so). Renaming a struct
+// type is harmless. The cost is 1 byte plus one byte per struct type in the
+// message; encoding and decoding speed are unchanged. To drop a field, keep it
+// in the struct and stop using it (or tag it `codec:"-"` only for a type that
+// never has to read old data).
 //
 // Under the hood, on first use of a Go type the codec builds an immutable
 // plan (field offsets, kinds, a schema fingerprint) from reflection and
@@ -36,6 +63,9 @@
 //
 //	message = header frame
 //	header  = byte(0xC0 | widthCode) fingerprint32        (5 bytes)
+//	          or, for MarshalEvolvable, byte(0xC4 | widthCode) fingerprint32
+//	          shape, where shape = uvarint(n) then n uvarint field counts, one
+//	          per struct type in the schema, in first-use order (see Schema evolution)
 //	          widthCode: 0 => 1-byte offsets, 1 => 2-byte, 2 => 4-byte
 //	frame   = bitmap scalars offsets heap
 //	bitmap  = max(1, ceil(nFields/8)) bytes; bit i set => field i non-zero
@@ -87,8 +117,9 @@ var (
 )
 
 const (
-	headerLen = 5
-	maxDepth  = 512
+	headerLen    = 5
+	maxDepth     = 512
+	hdrEvolvable = 0x04 // header flag: the message carries its struct field counts
 )
 
 // readUvarint handles the common one-byte case without entering the general
@@ -136,7 +167,9 @@ type node struct {
 	smode     sliceMode
 	fields    []field
 	varFields []int
-	nbm       int // bitmap bytes
+	nbm       int          // bitmap bytes
+	extra     []extraField // evolved plans: fields this type has that the writer's version lacked
+	sid       int          // kStruct: creation order, used to refer back to this struct in the fingerprint
 
 	batchT reflect.Type // kPtr to struct: []Target type, to allocate pointees in one block
 	alen   int          // kArray: length
@@ -149,6 +182,15 @@ type field struct {
 	off  uintptr
 	n    *node
 	name string
+}
+
+// extraField is a field of the reader's struct that the message's writer did
+// not have (it was added later). It is zeroed on decode.
+type extraField struct {
+	off  uintptr
+	rt   reflect.Type
+	name string
+	n    *node // for zeroing by kind; nil falls back to reflection
 }
 
 // emptyInterface matches the two-word representation used by an interface{}
@@ -168,9 +210,11 @@ func (n *node) isVar() bool {
 }
 
 type plan struct {
-	root *node
-	fp   uint32
-	last atomic.Int64 // body size of the last message, for width selection
+	root   *node
+	fp     uint32
+	counts []int        // field count of every struct in the schema, in creation order
+	shape  []byte       // counts, encoded for the evolvable header
+	last   atomic.Int64 // body size of the last message, for width selection
 }
 
 var plans sync.Map // reflect.Type -> *plan
@@ -188,25 +232,104 @@ func planFor(t reflect.Type) (*plan, error) {
 	if v, ok := plans.Load(t); ok {
 		return v.(*plan), nil
 	}
-	var sb strings.Builder
-	n, err := build(t, map[reflect.Type]*node{}, &sb)
+	b := &builder{memo: map[reflect.Type]*node{}}
+	n, err := b.build(t)
 	if err != nil {
 		return nil, err
 	}
+	pl := b.finish(t, n)
+	v, _ := plans.LoadOrStore(t, pl)
+	return v.(*plan), nil
+}
+
+// finish wraps a non-struct root, fingerprints the schema, and records the
+// struct field counts.
+func (b *builder) finish(t reflect.Type, n *node) *plan {
 	root := n
 	if n.kind != kStruct {
-		sb.WriteString("W")
+		b.sb.WriteString("W")
 		root = &node{kind: kStruct, rt: t, size: t.Size(), nbm: 1, fields: []field{{n: n, name: "V"}}}
 		if n.isVar() {
 			root.varFields = []int{0}
 		}
 	}
 	h := fnv.New64a()
-	h.Write([]byte(sb.String()))
+	h.Write([]byte(b.sb.String()))
 	s := h.Sum64()
-	pl := &plan{root: root, fp: uint32(s) ^ uint32(s>>32)}
-	v, _ := plans.LoadOrStore(t, pl)
-	return v.(*plan), nil
+	counts := make([]int, len(b.order))
+	for i, sn := range b.order {
+		counts[i] = len(sn.fields)
+	}
+	return &plan{root: root, fp: uint32(s) ^ uint32(s>>32), counts: counts, shape: appendShape(nil, counts)}
+}
+
+// appendShape encodes struct field counts: uvarint(len) then each count.
+func appendShape(dst []byte, counts []int) []byte {
+	dst = binary.AppendUvarint(dst, uint64(len(counts)))
+	for _, c := range counts {
+		dst = binary.AppendUvarint(dst, uint64(c))
+	}
+	return dst
+}
+
+// parseShape decodes appendShape output from the front of b and returns the
+// counts and the bytes consumed.
+func parseShape(b []byte) (counts []int, n int, ok bool) {
+	cnt, k := readUvarint(b)
+	if k <= 0 || cnt > uint64(len(b)) || cnt > maxShape {
+		return nil, 0, false
+	}
+	n = k
+	counts = make([]int, cnt)
+	for i := range counts {
+		c, k := readUvarint(b[n:])
+		if k <= 0 || c > 1<<16 {
+			return nil, 0, false
+		}
+		counts[i], n = int(c), n+k
+	}
+	return counts, n, true
+}
+
+const maxShape = 1 << 12 // most structs a schema may contain
+
+type evolvedKey struct {
+	t     reflect.Type
+	shape string
+}
+
+var (
+	evolvedPlans sync.Map // evolvedKey -> *plan
+	evolvedCount atomic.Int64
+)
+
+const maxEvolvedPlans = 256 // bounds the cache against hostile headers
+
+// evolvedPlan returns the plan for reading messages that an older version of
+// t wrote, where each struct had the given number of fields (a prefix of the
+// fields t has now). Fields added since are zeroed on decode. It fails with
+// ErrSchemaMismatch if a struct had more fields than it has now.
+func evolvedPlan(t reflect.Type, counts []int) (*plan, error) {
+	key := evolvedKey{t, string(appendShape(nil, counts))}
+	if v, ok := evolvedPlans.Load(key); ok {
+		return v.(*plan), nil
+	}
+	b := &builder{memo: map[reflect.Type]*node{}, counts: counts}
+	n, err := b.build(t)
+	if err != nil {
+		return nil, err
+	}
+	if len(b.order) != len(counts) {
+		return nil, fmt.Errorf("%w: the message describes %d structs, this type has %d", ErrSchemaMismatch, len(counts), len(b.order))
+	}
+	pl := b.finish(t, n)
+	if evolvedCount.Load() < maxEvolvedPlans {
+		if v, loaded := evolvedPlans.LoadOrStore(key, pl); loaded {
+			return v.(*plan), nil
+		}
+		evolvedCount.Add(1)
+	}
+	return pl, nil
 }
 
 func classify(el *node) sliceMode {
@@ -229,21 +352,41 @@ func fieldName(sf reflect.StructField) (skip bool) {
 	if sf.PkgPath != "" {
 		return true
 	}
-	return sf.Tag.Get("codec") == "-" || sf.Tag.Get("json") == "-"
+	return sf.Tag.Get("codec") == "-"
 }
 
-func build(t reflect.Type, memo map[reflect.Type]*node, sb *strings.Builder) (*node, error) {
+// fieldLabel is the name a struct field goes by in text and in dynamic
+// (interface{}) values: the codec tag if it has one, else the Go field name.
+func fieldLabel(sf reflect.StructField) string {
+	if tag, _, _ := strings.Cut(sf.Tag.Get("codec"), ","); tag != "" && tag != "-" {
+		return tag
+	}
+	return sf.Name
+}
+
+// builder constructs the node tree and schema fingerprint for a type.
+type builder struct {
+	memo   map[reflect.Type]*node
+	sb     strings.Builder
+	order  []*node // struct nodes in creation order
+	counts []int   // if set, struct i keeps only its first counts[i] fields
+}
+
+func (b *builder) build(t reflect.Type) (*node, error) {
+	sb, memo := &b.sb, b.memo
 	n := &node{rt: t, size: t.Size()}
 	if k := t.Kind(); k != reflect.Interface && k != reflect.Pointer {
 		pt := reflect.PointerTo(t)
 		switch {
 		case pt.Implements(binMarshaler) && pt.Implements(binUnmarshaler):
 			n.kind = kBin
-			sb.WriteString("bin:" + t.String())
+			sb.WriteString("bin:")
+			sb.WriteString(t.String())
 			return n, nil
 		case pt.Implements(txtMarshaler) && pt.Implements(txtUnmarshaler):
 			n.kind, n.text = kBin, true
-			sb.WriteString("txt:" + t.String())
+			sb.WriteString("txt:")
+			sb.WriteString(t.String())
 			return n, nil
 		}
 	}
@@ -273,7 +416,7 @@ func build(t reflect.Type, memo map[reflect.Type]*node, sb *strings.Builder) (*n
 			fmt.Fprintf(sb, "%d", n.alen)
 		}
 		sb.WriteString("]")
-		el, err := build(t.Elem(), memo, sb)
+		el, err := b.build(t.Elem())
 		if err != nil {
 			return nil, err
 		}
@@ -282,12 +425,12 @@ func build(t reflect.Type, memo map[reflect.Type]*node, sb *strings.Builder) (*n
 	case reflect.Map:
 		n.kind = kMap
 		sb.WriteString("map[")
-		k, err := build(t.Key(), memo, sb)
+		k, err := b.build(t.Key())
 		if err != nil {
 			return nil, err
 		}
 		sb.WriteString("]")
-		v, err := build(t.Elem(), memo, sb)
+		v, err := b.build(t.Elem())
 		if err != nil {
 			return nil, err
 		}
@@ -296,7 +439,7 @@ func build(t reflect.Type, memo map[reflect.Type]*node, sb *strings.Builder) (*n
 	case reflect.Pointer:
 		n.kind = kPtr
 		sb.WriteByte('*')
-		el, err := build(t.Elem(), memo, sb)
+		el, err := b.build(t.Elem())
 		if err != nil {
 			return nil, err
 		}
@@ -307,21 +450,49 @@ func build(t reflect.Type, memo map[reflect.Type]*node, sb *strings.Builder) (*n
 		return n, nil
 	case reflect.Struct:
 		if m, ok := memo[t]; ok {
-			sb.WriteString("@")
-			sb.WriteString(t.String())
+			fmt.Fprintf(sb, "@%d", m.sid) // by position, so renaming a type does not change the schema
 			return m, nil
 		}
 		n.kind = kStruct
 		memo[t] = n
+		idx := len(b.order)
+		n.sid = idx
+		b.order = append(b.order, n)
+		limit := -1 // evolved plans keep only the first limit fields
+		if b.counts != nil {
+			if idx >= len(b.counts) {
+				return nil, fmt.Errorf("%w: the message describes fewer structs than this type has", ErrSchemaMismatch)
+			}
+			limit = b.counts[idx]
+			visible := 0
+			for i := 0; i < t.NumField(); i++ {
+				if !fieldName(t.Field(i)) {
+					visible++
+				}
+			}
+			if limit > visible {
+				return nil, fmt.Errorf("%w: written by a newer schema: the message has %d fields for %s, this version has %d", ErrSchemaMismatch, limit, t, visible)
+			}
+		}
 		sb.WriteByte('{')
+		kept := 0
 		for i := 0; i < t.NumField(); i++ {
 			sf := t.Field(i)
 			if fieldName(sf) {
 				continue
 			}
+			if limit >= 0 && kept >= limit {
+				x := extraField{off: sf.Offset, rt: sf.Type, name: sf.Name}
+				if xn, err := (&builder{memo: map[reflect.Type]*node{}}).build(sf.Type); err == nil {
+					x.n = xn // built on its own, so it does not disturb the schema's struct order
+				}
+				n.extra = append(n.extra, x)
+				continue
+			}
+			kept++
 			sb.WriteString(sf.Name)
 			sb.WriteByte(':')
-			fn, err := build(sf.Type, memo, sb)
+			fn, err := b.build(sf.Type)
 			if err != nil {
 				return nil, fmt.Errorf("%s.%s: %w", t, sf.Name, err)
 			}

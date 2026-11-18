@@ -49,13 +49,21 @@ func View(data []byte, schema any) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	if len(data) < headerLen || data[0]&0xFC != 0xC0 || data[0]&3 > 2 {
-		return Value{}, ErrBadHeader
+	pl, body, err := openMessage(data, t, pl)
+	if err != nil {
+		return Value{}, err
 	}
-	if le.Uint32(data[1:]) != pl.fp {
-		return Value{}, ErrSchemaMismatch
+	return Value{n: pl.root, w: 1 << (data[0] & 3), b: body, ok: true, col: -1}, nil
+}
+
+// absentValue is the value of a field that the message predates.
+func absentValue(rt reflect.Type) (Value, error) {
+	b := &builder{memo: map[reflect.Type]*node{}}
+	n, err := b.build(rt)
+	if err != nil {
+		return Value{}, err
 	}
-	return Value{n: pl.root, w: 1 << (data[0] & 3), b: data[headerLen:], ok: true, col: -1}, nil
+	return Value{n: n, w: 1, col: -1}, nil
 }
 
 // Present reports whether the value is non-zero in the message. Absent
@@ -193,6 +201,11 @@ func (v Value) Field(name string) (Value, error) {
 		}
 	}
 	if idx < 0 {
+		for i := range n.extra { // added after the message was written: reads as zero
+			if n.extra[i].name == name {
+				return absentValue(n.extra[i].rt)
+			}
+		}
 		return Value{}, ErrNoField
 	}
 	d := dec{w: v.w}

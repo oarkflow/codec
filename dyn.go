@@ -7,7 +7,6 @@ import (
 	"math"
 	"reflect"
 	"sort"
-	"strings"
 	"unsafe"
 )
 
@@ -134,11 +133,7 @@ func (e *enc) dyn(v reflect.Value, depth int) {
 			if fieldName(sf) {
 				continue
 			}
-			name := sf.Name
-			if tag, _, _ := strings.Cut(sf.Tag.Get("json"), ","); tag != "" {
-				name = tag
-			}
-			idx, names = append(idx, i), append(names, name)
+			idx, names = append(idx, i), append(names, fieldLabel(sf))
 		}
 		e.buf = append(e.buf, dMap)
 		e.buf = binary.AppendUvarint(e.buf, uint64(len(idx)))
@@ -361,7 +356,7 @@ func (d *dec) dyn(b []byte, depth int) (any, int, error) {
 		if !ok {
 			return nil, 0, ErrCorrupt
 		}
-		return unzigzag(u), pos, nil
+		return d.boxInt64(unzigzag(u)), pos, nil
 	case dUint:
 		u, ok := uv()
 		if !ok {
@@ -372,7 +367,7 @@ func (d *dec) dyn(b []byte, depth int) (any, int, error) {
 		if len(b) < 9 {
 			return nil, 0, ErrCorrupt
 		}
-		return math.Float64frombits(le.Uint64(b[1:])), 9, nil
+		return d.boxFloat64(math.Float64frombits(le.Uint64(b[1:]))), 9, nil
 	case dStr, dBytes:
 		l, ok := uv()
 		if !ok || l > uint64(len(b)-pos) {
@@ -464,3 +459,27 @@ func (d *dec) dyn(b []byte, depth int) (any, int, error) {
 	}
 	return nil, 0, ErrCorrupt
 }
+
+// Boxing a number into an interface normally costs one heap allocation each.
+// Instead the 8-byte payload is carved from the decode arena and the interface
+// is assembled around it (the arena is pointer-free memory, so this is GC-safe
+// and the interface keeps its block alive).
+type eface struct{ typ, data unsafe.Pointer }
+
+var (
+	typInt64   = (*eface)(unsafe.Pointer(&[]any{int64(0)}[0])).typ
+	typUint64  = (*eface)(unsafe.Pointer(&[]any{uint64(0)}[0])).typ
+	typFloat64 = (*eface)(unsafe.Pointer(&[]any{float64(0)}[0])).typ
+)
+
+func (d *dec) box(typ unsafe.Pointer, bits uint64) any {
+	p := d.carve(8, 8)
+	*(*uint64)(p) = bits
+	var v any
+	*(*eface)(unsafe.Pointer(&v)) = eface{typ, p}
+	return v
+}
+
+func (d *dec) boxInt64(x int64) any     { return d.box(typInt64, uint64(x)) }
+func (d *dec) boxUint64(x uint64) any   { return d.box(typUint64, x) }
+func (d *dec) boxFloat64(x float64) any { return d.box(typFloat64, math.Float64bits(x)) }

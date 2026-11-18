@@ -32,6 +32,8 @@ func cases[T any](v *T, pbMsg proto.Message, pbNew func() proto.Message) []tcase
 	cs := []tcase{
 		{"strata", func(b []byte) ([]byte, error) { return codec.Append(b[:0], v) },
 			func(d []byte) error { return codec.Unmarshal(d, out) }},
+		{"strata-nocopy", func(b []byte) ([]byte, error) { return codec.Append(b[:0], v) },
+			func(d []byte) error { return codec.UnmarshalNoCopy(d, out) }},
 		{"msgpack-vmihailenco", func([]byte) ([]byte, error) { return vmsgpack.Marshal(v) },
 			func(d []byte) error { return vmsgpack.Unmarshal(d, out) }},
 		{"msgpack-shamaton", func([]byte) ([]byte, error) { return shamaton.Marshal(v) },

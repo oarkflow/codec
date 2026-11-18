@@ -1,7 +1,9 @@
 package codec
 
 import (
+	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"unsafe"
 )
@@ -51,6 +53,7 @@ type dec struct {
 	strArena sliceArena
 	arenas   map[*node]sliceArena
 	maps     map[*node]mapBuffers
+	alias    bool // strings and dynamic []byte point into src instead of being copied
 }
 
 // Unmarshal decodes data into v, which must be a non-nil pointer to a value of
@@ -62,7 +65,15 @@ type dec struct {
 // string keeps its block alive. Malformed input returns an error and never
 // panics.
 
-func Unmarshal(data []byte, v any) error {
+func Unmarshal(data []byte, v any) error { return unmarshal(data, v, false) }
+
+// UnmarshalNoCopy is Unmarshal, except decoded strings (and []byte inside
+// interface{} values) point into data instead of being copied, which removes
+// the last per-decode allocation. The caller must not modify data, and data
+// stays reachable for as long as any decoded string does.
+func UnmarshalNoCopy(data []byte, v any) error { return unmarshal(data, v, true) }
+
+func unmarshal(data []byte, v any, alias bool) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return ErrNeedPointer
@@ -78,11 +89,9 @@ func Unmarshal(data []byte, v any) error {
 	if err != nil {
 		return err
 	}
-	if len(data) < headerLen || data[0]&0xFC != 0xC0 || data[0]&3 > 2 {
-		return ErrBadHeader
-	}
-	if le.Uint32(data[1:]) != pl.fp {
-		return ErrSchemaMismatch
+	pl, body, err := openMessage(data, rv.Type().Elem(), pl)
+	if err != nil {
+		return err
 	}
 	sc := decScratchPool.Get().(*decScratch)
 	// Decoded string bytes cannot exceed the input size; cap the initial arena
@@ -91,8 +100,8 @@ func Unmarshal(data []byte, v any) error {
 	if len(data) < 256 {
 		chunk = max(len(data)/2, 64)
 	}
-	d := dec{w: 1 << (data[0] & 3), budget: MaxAlloc, chunk: chunk, u64: sc.u64, strs: sc.strs, src: data, maps: sc.maps}
-	err = d.frame(pl.root, rv.UnsafePointer(), data[headerLen:])
+	d := dec{w: 1 << (data[0] & 3), budget: MaxAlloc, chunk: chunk, u64: sc.u64, strs: sc.strs, src: data, maps: sc.maps, alias: alias}
+	err = d.frame(pl.root, rv.UnsafePointer(), body)
 	clear(d.strs) // decoded strings live in d.keep, never in pooled scratch
 	if cap(d.u64) <= maxReusableDecodeScratch {
 		sc.u64 = d.u64[:0]
@@ -133,6 +142,9 @@ func (d *dec) str(b []byte) string {
 	if n == 0 {
 		return ""
 	}
+	if d.alias {
+		return unsafe.String(&b[0], n)
+	}
 	p := d.carve(uintptr(n), 1)
 	copy(unsafe.Slice((*byte)(p), n), b)
 	return unsafe.String((*byte)(p), n)
@@ -160,6 +172,9 @@ func (d *dec) frame(n *node, p unsafe.Pointer, b []byte) error {
 func (d *dec) frame0(n *node, p unsafe.Pointer, b []byte) error {
 	if len(b) < n.nbm {
 		return ErrCorrupt
+	}
+	if n.extra != nil {
+		zeroExtra(n, p)
 	}
 	pos := n.nbm
 	nv := 0
@@ -235,6 +250,57 @@ func (d *dec) frame0(n *node, p unsafe.Pointer, b []byte) error {
 		j++
 	}
 	return nil
+}
+
+// zeroExtra zeroes the fields of an evolved struct that the message's writer
+// did not have.
+func zeroExtra(n *node, p unsafe.Pointer) {
+	for i := range n.extra {
+		x := &n.extra[i]
+		if x.n != nil {
+			zeroAt(x.n, unsafe.Add(p, x.off))
+		} else {
+			reflect.NewAt(x.rt, unsafe.Add(p, x.off)).Elem().SetZero()
+		}
+	}
+}
+
+// openMessage checks the header of data against t's plan pl and returns the
+// plan to decode with (pl itself, or one derived for an older schema) and the
+// bytes of the frame.
+func openMessage(data []byte, t reflect.Type, pl *plan) (*plan, []byte, error) {
+	if len(data) < headerLen || data[0]&0xF8 != 0xC0 || data[0]&3 > 2 {
+		return nil, nil, ErrBadHeader
+	}
+	fp := le.Uint32(data[1:])
+	if data[0]&hdrEvolvable == 0 {
+		if fp != pl.fp {
+			return nil, nil, ErrSchemaMismatch
+		}
+		return pl, data[headerLen:], nil
+	}
+	if rest := data[headerLen:]; len(rest) >= len(pl.shape) && string(rest[:len(pl.shape)]) == string(pl.shape) {
+		// the writer had exactly this schema: no parsing, no derived plan
+		if fp != pl.fp {
+			return nil, nil, fmt.Errorf("%w: the fields the message has do not match this type's first fields (fields may only be added at the end of a struct)", ErrSchemaMismatch)
+		}
+		return pl, rest[len(pl.shape):], nil
+	}
+	counts, n, ok := parseShape(data[headerLen:])
+	if !ok {
+		return nil, nil, ErrBadHeader
+	}
+	use := pl
+	if !slices.Equal(counts, pl.counts) {
+		var err error
+		if use, err = evolvedPlan(t, counts); err != nil {
+			return nil, nil, err
+		}
+	}
+	if fp != use.fp {
+		return nil, nil, fmt.Errorf("%w: the fields the message has do not match this type's first fields (fields may only be added at the end of a struct)", ErrSchemaMismatch)
+	}
+	return use, data[headerLen+n:], nil
 }
 
 func zeroAt(n *node, p unsafe.Pointer) {
