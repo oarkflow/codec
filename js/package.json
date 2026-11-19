@@ -1,0 +1,24 @@
+{
+  "name": "@oarkflow/codec",
+  "version": "0.1.0",
+  "description": "JavaScript and TypeScript interoperability for the Codec binary format",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check:examples": "tsc -p tsconfig.examples.json",
+    "test": "npm run build && npm run check:examples && node --test test/*.test.mjs && node examples/basic.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.2.2"
+  },
+  "license": "MIT"
+}

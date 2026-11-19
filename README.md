@@ -30,6 +30,7 @@ Module: `github.com/oarkflow/codec` (Go 1.27+). Tests, examples and benchmarks a
 6. [Text notation](#6-text-notation)
 7. [Base64 armor](#7-base64-armor)
 8. [Formats, media types and HTTP](#8-formats-media-types-and-http)
+   - [JavaScript and TypeScript](#84-javascript-and-typescript)
 9. [The store](#9-the-store)
 10. [Specification: formats, protocols and standards](#10-specification-formats-protocols-and-standards)
 11. [Performance](#11-performance)
@@ -387,6 +388,16 @@ curl -X DELETE localhost:8080/users/ada
 
 Run `go run ./examples/http` for a self-contained demo, or `go run ./examples/http -serve :8080` to keep the server up. Errors come back in the negotiated format, for example `error codec text: line 1, column 1: main.User has no field "Nmae" (fields: Name, Age, Tags, Email)`.
 
+### 8.4 JavaScript and TypeScript
+
+The [`js`](js/README.md) package implements the binary wire format with
+explicit JS/TS schemas. It reads Go messages, writes messages the Go decoder
+accepts, supports evolvable schemas, Base64 armor and Go's length-prefixed
+streams, and includes cross-language fixtures. Run `cd js && npm test` to build
+it and verify both directions. The package is currently source-only in this
+repository; custom Go marshalers and invalid UTF-8 Go strings require
+application-specific handling.
+
 ---
 
 ## 9. The store
@@ -730,7 +741,7 @@ Lane *i* holds field *i* of every element. It spans from its directory offset to
 
 ### 10.4 Maps
 
-A map payload is `uvarint(len(keys))` followed by the **keys slice payload** (10.3, with the key type as element) and then the **values slice payload**. Both slices have the same count. For string, integer, float and bool keys the encoder writes entries in ascending key order (integers and floats numerically, strings bytewise, false before true), which makes the output deterministic; a decoder does not rely on the order. Struct and array keys are encoded but have no defined order.
+A map payload is `uvarint(byte length of keys slice payload)`, then the **keys slice payload** (10.3, with the key type as element), then the **values slice payload**. Both slices have the same element count. For string, integer, float and bool keys the encoder writes entries in ascending key order (integers and floats numerically, strings bytewise, false before true), which makes the output deterministic; a decoder does not rely on the order. Struct and array keys are encoded but have no defined order.
 
 ### 10.5 Dynamic values (`interface{}`)
 
