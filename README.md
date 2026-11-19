@@ -374,7 +374,7 @@ The library has no transport dependency. It provides plain functions over string
 
 ### 8.3 HTTP
 
-`examples/http` wires this to `net/http` in about 60 lines (the library itself does not import it) and puts a store behind it. Every request and response can be any of the three formats:
+`examples/http` wires format detection, decoding, encoding, and negotiation to `net/http` (the library itself does not import it) and puts a store behind it. Its default demo uses an in-process HTTP transport; `-serve` starts a real listener. Every request and response can be any of the three formats:
 
 ```
 curl -X PUT localhost:8080/users/ada -d 'Name Ada; Age 36; Tags admin dev'

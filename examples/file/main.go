@@ -1,7 +1,7 @@
 // file: save and load Strata data on disk. Two patterns:
 //  1. one value per file (write the bytes, read them back);
 //  2. an append-only log of records, each prefixed with its length, read back
-//     with a single reused value.
+//     through one reusable input buffer while each decoded record is independent.
 package main
 
 import (
@@ -68,8 +68,13 @@ func appendRecords(path string, recs []LogRecord) error {
 			return err
 		}
 		var hdr [binary.MaxVarintLen64]byte
-		w.Write(hdr[:binary.PutUvarint(hdr[:], uint64(len(buf)))])
-		w.Write(buf)
+		n := binary.PutUvarint(hdr[:], uint64(len(buf)))
+		if _, err := w.Write(hdr[:n]); err != nil {
+			return err
+		}
+		if _, err := w.Write(buf); err != nil {
+			return err
+		}
 	}
 	return w.Flush()
 }
@@ -121,7 +126,10 @@ func main() {
 	if err := saveConfig(cfgPath, cfg); err != nil {
 		log.Fatal(err)
 	}
-	st, _ := os.Stat(cfgPath)
+	st, err := os.Stat(cfgPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 	loaded, err := loadConfig(cfgPath)
 	if err != nil {
 		log.Fatal(err)
@@ -142,8 +150,13 @@ func main() {
 	}
 
 	// Corrupt files are reported, not panicked on.
-	data, _ := os.ReadFile(cfgPath)
-	_ = os.WriteFile(cfgPath, data[:len(data)/2], 0o644)
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, data[:len(data)/2], 0o644); err != nil {
+		log.Fatal(err)
+	}
 	_, err = loadConfig(cfgPath)
 	fmt.Println("truncated file:", err)
 }

@@ -47,7 +47,11 @@ type UserV2 struct {
 
 func main() {
 	// 1. bytes written by v1 ...
-	v1 := UserV1{"Ada", 36, []string{"admin"}, AddrV1{"12 Main", 12345}, []AddrV1{{"a", 1}, {"b", 2}}}
+	v1 := UserV1{
+		Name: "Ada", Age: 36, Tags: []string{"admin"},
+		Addr:  AddrV1{Street: "12 Main", Zip: 12345},
+		Notes: []AddrV1{{Street: "a", Zip: 1}, {Street: "b", Zip: 2}},
+	}
 	data, err := codec.MarshalEvolvable(&v1)
 	if err != nil {
 		log.Fatal(err)
@@ -61,7 +65,10 @@ func main() {
 	fmt.Printf("v2 reads v1 data: %+v\n", v2)
 
 	// 2. the other direction is refused, never misread
-	newer, _ := codec.MarshalEvolvable(&UserV2{Name: "Bob", Email: "bob@x"})
+	newer, err := codec.MarshalEvolvable(&UserV2{Name: "Bob", Email: "bob@x"})
+	if err != nil {
+		log.Fatal(err)
+	}
 	var old UserV1
 	fmt.Println("v1 reads v2 data:", codec.Unmarshal(newer, &old))
 
@@ -76,19 +83,45 @@ func main() {
 
 	// 4. the persistent store writes evolvable records by default, so an
 	// upgraded program opens yesterday's database as it is
-	dir, _ := os.MkdirTemp("", "evolve")
+	dir, err := os.MkdirTemp("", "evolve")
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "users")
-	db1, _ := store.Open[UserV1](path, nil)
-	db1.Put("u:1", &v1)
-	db1.Close()
+	db1, err := store.Open[UserV1](path, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := db1.Put("u:1", &v1); err != nil {
+		log.Fatal(err)
+	}
+	if err := db1.Close(); err != nil {
+		log.Fatal(err)
+	}
 
-	db2, _ := store.Open[UserV2](path, nil) // same files, new type
-	defer db2.Close()
+	db2, err := store.Open[UserV2](path, nil) // same files, new type
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := db2.Close(); err != nil {
+			log.Print(err)
+		}
+	}()
 	var u UserV2
-	db2.Get("u:1", &u)
+	if err := db2.Get("u:1", &u); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("store: %s, %d notes, email=%q\n", u.Name, len(u.Notes), u.Email)
-	db2.Update("u:1", func(u *UserV2, _ bool) error { u.Email = "ada@example.com"; return nil })
-	db2.Get("u:1", &u)
+	if err := db2.Update("u:1", func(u *UserV2, _ bool) error {
+		u.Email = "ada@example.com"
+		return nil
+	}); err != nil {
+		log.Fatal(err)
+	}
+	if err := db2.Get("u:1", &u); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("after update: email=%q (record rewritten in the v2 layout)\n", u.Email)
 }

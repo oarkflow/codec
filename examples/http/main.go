@@ -1,7 +1,8 @@
 // http: Strata over HTTP request/response. The codec library knows nothing
-// about HTTP; this example wires it to net/http in about 60 lines using only
-// codec.DecodeAs / EncodeAs / Negotiate, and puts a persistent, wildcard-
-// searchable store behind it.
+// about HTTP; this example wires it to net/http with format detection and
+// negotiation helpers, then puts a persistent, wildcard-searchable store
+// behind it. The default demo uses an in-process transport; -serve starts a
+// real listener for curl.
 //
 // Every request and response can be any of three formats, chosen per request:
 //
@@ -26,8 +27,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 
@@ -49,6 +50,16 @@ type Page struct {
 
 type Error struct {
 	Message string `codec:"error"`
+}
+
+// inProcessTransport runs the demo client against the same handler without
+// requiring a local TCP listener. The -serve mode below exercises real HTTP.
+type inProcessTransport struct{ handler http.Handler }
+
+func (t inProcessTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	w := httptest.NewRecorder()
+	t.handler.ServeHTTP(w, r)
+	return w.Result(), nil
 }
 
 // ---- the whole HTTP binding: negotiate, decode, encode ----
@@ -179,7 +190,10 @@ func call[Resp any](method, url string, f codec.Format, req any, resp *Resp) (in
 		}
 		body = bytes.NewReader(b)
 	}
-	hr, _ := http.NewRequest(method, url, body)
+	hr, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return 0, err
+	}
 	if req != nil {
 		hr.Header.Set("Content-Type", f.MediaType())
 	}
@@ -189,7 +203,10 @@ func call[Resp any](method, url string, f codec.Format, req any, resp *Resp) (in
 		return 0, err
 	}
 	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return res.StatusCode, err
+	}
 	if len(data) > 0 && resp != nil && res.StatusCode < 300 {
 		_, err = codec.DecodeAs(res.Header.Get("Content-Type"), data, resp)
 	}
@@ -198,7 +215,10 @@ func call[Resp any](method, url string, f codec.Format, req any, resp *Resp) (in
 
 // raw sends text exactly as a person would with curl -d.
 func raw(method, url, body, accept string) (int, string) {
-	hr, _ := http.NewRequest(method, url, strings.NewReader(body))
+	hr, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		return 0, err.Error()
+	}
 	if accept != "" {
 		hr.Header.Set("Accept", accept)
 	}
@@ -207,7 +227,10 @@ func raw(method, url, body, accept string) (int, string) {
 		return 0, err.Error()
 	}
 	defer res.Body.Close()
-	data, _ := io.ReadAll(res.Body)
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return res.StatusCode, err.Error()
+	}
 	return res.StatusCode, strings.TrimSpace(string(data))
 }
 
@@ -215,7 +238,10 @@ func main() {
 	serve := flag.String("serve", "", "listen address (e.g. :8080) to keep the server running for curl")
 	flag.Parse()
 
-	dir, _ := os.MkdirTemp("", "strata-http")
+	dir, err := os.MkdirTemp("", "strata-http")
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer os.RemoveAll(dir)
 	db, err := store.Open[User](dir, nil)
 	if err != nil {
@@ -229,9 +255,8 @@ func main() {
 		log.Fatal(http.ListenAndServe(*serve, srv))
 	}
 
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	go http.Serve(ln, srv)
-	base := "http://" + ln.Addr().String()
+	http.DefaultClient = &http.Client{Transport: inProcessTransport{handler: srv}}
+	base := "http://example.local"
 
 	// 1. a program sends and receives the compact binary form
 	var u User
