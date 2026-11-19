@@ -2,6 +2,7 @@ package store
 
 import (
 	"os"
+	"time"
 )
 
 // Compaction merges a short run of adjacent immutable segments into new
@@ -20,7 +21,7 @@ import (
 
 const maxRun = 4 // segments merged at once; bounds memory and time per run
 
-var noLoc = loc{sid: ^uint32(0)} // marks a kept tombstone in the copy list
+var noLoc = loc{seg: &segment{sid: ^uint32(0)}} // marks a kept tombstone in the copy list
 
 // pickRun finds the first run of adjacent immutable segments whose dead
 // fraction is at least ratio (0 means any dead byte). Caller holds mu.
@@ -31,7 +32,8 @@ func (db *DB[T]) pickRun(ratio float64) []uint32 {
 			break
 		}
 		s := db.segs[sid]
-		if s.dead > 0 && float64(s.dead) >= ratio*float64(s.size) {
+		hasExpired := ratio == 0 && db.hasExpiredCurrent(s)
+		if (s.dead > 0 || hasExpired) && float64(s.dead) >= ratio*float64(s.size) {
 			if run = append(run, sid); len(run) == maxRun {
 				break
 			}
@@ -40,6 +42,24 @@ func (db *DB[T]) pickRun(ratio float64) []uint32 {
 		}
 	}
 	return run
+}
+
+// hasExpiredCurrent checks whether compaction can discard an expired value in
+// this segment. Caller holds db.mu for reading or writing.
+func (db *DB[T]) hasExpiredCurrent(s *segment) bool {
+	now := time.Now().UnixNano()
+	found := false
+	scanSegment(s.f, int64(len(segMagic)), s.size, func(r *rec) bool {
+		if r.del || r.expiresAt == 0 || now < r.expiresAt {
+			return true
+		}
+		if l, ok := db.t.get(r.key); ok && l.seg == s && l.off == uint32(r.voff()) && l.expiresAt == r.expiresAt {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func (db *DB[T]) compactLoop() {
@@ -133,6 +153,7 @@ func (db *DB[T]) compactRun(run []uint32) error {
 	)
 	fail := func(err error) error {
 		for _, o := range outs {
+			o.unmap()
 			o.f.Close()
 			os.Remove(segPath(db.dir, o.sid))
 		}
@@ -167,13 +188,14 @@ func (db *DB[T]) compactRun(run []uint32) error {
 	for _, in := range ins {
 		end := scanSegment(in.f, int64(len(segMagic)), in.size, func(r *rec) bool {
 			var old loc
+			expired := !r.del && r.expiresAt != 0 && time.Now().UnixNano() >= r.expiresAt
 			if r.del {
 				if dropTombs {
 					return true
 				}
 				old = noLoc
 			} else {
-				old = loc{in.sid, uint32(r.voff()), r.vlen}
+				old = loc{seg: in, off: uint32(r.voff()), vlen: r.vlen, expiresAt: r.expiresAt}
 				db.mu.RLock()
 				l, ok := db.t.get(r.key)
 				db.mu.RUnlock()
@@ -186,17 +208,24 @@ func (db *DB[T]) compactRun(run []uint32) error {
 					return false
 				}
 			}
-			if r.del {
+			if r.del || expired {
 				buf = appendRec(buf, r.key, nil, true, false)
 			} else {
 				if cap(val) < int(r.vlen) {
 					val = make([]byte, r.vlen)
 				}
 				val = val[:r.vlen]
-				if _, ferr = in.f.ReadAt(val, r.voff()); ferr != nil {
+				if len(in.mapped) > 0 {
+					start := int(r.voff())
+					if start < 0 || start+len(val) > len(in.mapped) {
+						ferr = ErrCorrupt
+						return false
+					}
+					copy(val, in.mapped[start:start+len(val)])
+				} else if _, ferr = in.f.ReadAt(val, r.voff()); ferr != nil {
 					return false
 				}
-				buf = appendRec(buf, r.key, val, false, false)
+				buf = appendRecTTL(buf, r.key, val, false, false, r.expiresAt)
 			}
 			olds = append(olds, old)
 			if len(buf) >= 1<<20 {
@@ -220,6 +249,7 @@ func (db *DB[T]) compactRun(run []uint32) error {
 		if err := o.f.Sync(); err != nil {
 			return fail(err)
 		}
+		o.mapReadOnly()
 	}
 
 	// swap the manifest: outputs replace the run, atomically
@@ -259,18 +289,30 @@ func (db *DB[T]) compactRun(run []uint32) error {
 		key      string
 		old, new loc
 		size     int64
+		del      bool
 	}
 	k := 0
 	for _, o := range outs {
 		var batch []move
 		apply := func() {
 			db.mu.Lock()
+			changed := false
 			for _, m := range batch {
 				if l, ok := db.t.get([]byte(m.key)); ok && l == m.old {
-					db.t.set([]byte(m.key), m.new)
+					if m.del {
+						db.t.del([]byte(m.key))
+						db.cacheDelete(m.key)
+						db.scheduleExpiry(m.key, loc{}, false)
+					} else {
+						db.t.set([]byte(m.key), m.new)
+					}
+					changed = true
 				} else {
 					o.dead += m.size // changed while copying: the copy is garbage
 				}
+			}
+			if changed {
+				db.indexGen++
 			}
 			db.mu.Unlock()
 			batch = batch[:0]
@@ -279,7 +321,7 @@ func (db *DB[T]) compactRun(run []uint32) error {
 			old := olds[k]
 			k++
 			if old != noLoc {
-				batch = append(batch, move{string(r.key), old, loc{o.sid, uint32(r.voff()), r.vlen}, r.size()})
+				batch = append(batch, move{string(r.key), old, loc{seg: o, off: uint32(r.voff()), vlen: r.vlen, expiresAt: r.expiresAt}, r.size(), r.del})
 				if len(batch) >= 1024 {
 					apply()
 				}
@@ -293,6 +335,7 @@ func (db *DB[T]) compactRun(run []uint32) error {
 	db.mu.Lock()
 	for _, in := range ins {
 		delete(db.segs, in.sid)
+		in.unmap()
 		in.f.Close()
 	}
 	db.mu.Unlock()

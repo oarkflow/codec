@@ -24,7 +24,7 @@ func TestTreeAgainstMap(t *testing.T) {
 		k := rk()
 		switch r.Intn(3) {
 		case 0, 1:
-			l := loc{uint32(i), uint32(i), uint32(i)}
+			l := loc{seg: &segment{sid: uint32(i)}, off: uint32(i), vlen: uint32(i)}
 			old, had := tr.set([]byte(k), l)
 			o2, h2 := ref[k]
 			if had != h2 || old != o2 {
@@ -66,6 +66,41 @@ func TestTreeAgainstMap(t *testing.T) {
 		if g, ok := tr.get([]byte(k)); !ok || g != l {
 			t.Fatalf("get %q", k)
 		}
+	}
+}
+
+func TestTreeScanAllKeysCacheInvalidation(t *testing.T) {
+	tr := &tree{}
+	for i, key := range []string{"b", "a", "a/x", ""} {
+		tr.set([]byte(key), loc{off: uint32(i)})
+	}
+	var first []string
+	if tr.scanAllKeys(func(key string, _ loc) bool {
+		first = append(first, key)
+		return true
+	}) || len(first) != 0 {
+		t.Fatalf("first full scan should use the uncached path, got %q", first)
+	}
+	collect := func() []string {
+		var got []string
+		visit := func(key string, _ loc) bool {
+			got = append(got, key)
+			return true
+		}
+		if !tr.scanAllKeys(visit) {
+			t.Fatal("repeat full scan did not build the key cache")
+		}
+		return got
+	}
+	want := []string{"", "a", "a/x", "b"}
+	if got := collect(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("first cached keys = %q, want %q", got, want)
+	}
+	tr.set([]byte("aa"), loc{off: 9})
+	tr.del([]byte("a/x"))
+	want = []string{"", "a", "aa", "b"}
+	if got := collect(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("keys after insert/delete = %q, want %q", got, want)
 	}
 }
 

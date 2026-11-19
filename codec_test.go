@@ -298,6 +298,38 @@ func TestUnmarshalNoCopy(t *testing.T) {
 	}
 }
 
+func TestReusableValueDecoder(t *testing.T) {
+	in := sample()
+	b, err := MarshalEvolvable(&in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewValueDecoder[Rich]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		var got Rich
+		if err := d.UnmarshalNoCopy(b, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, in) {
+			t.Fatalf("decode %d differs: %#v", i, got)
+		}
+	}
+	dp, err := NewValueDecoder[*Rich]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *Rich
+	if err := dp.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || !reflect.DeepEqual(*got, in) {
+		t.Fatalf("pointer decode differs: %#v", got)
+	}
+}
+
 func FuzzUnmarshalNoCopy(f *testing.F) {
 	in := sample()
 	b, _ := Marshal(&in)

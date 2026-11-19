@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"slices"
@@ -73,7 +74,44 @@ func Unmarshal(data []byte, v any) error { return unmarshal(data, v, false) }
 // stays reachable for as long as any decoded string does.
 func UnmarshalNoCopy(data []byte, v any) error { return unmarshal(data, v, true) }
 
+// ValueDecoder reuses a type plan and decoder scratch space across values of
+// T. It is intended for sequential decoding loops and is not safe for
+// concurrent use. Do not copy it after first use.
+type ValueDecoder[T any] struct {
+	plan    *plan
+	scratch decScratch
+}
+
+// NewValueDecoder creates a reusable decoder for values of T.
+func NewValueDecoder[T any]() (*ValueDecoder[T], error) {
+	t := reflect.TypeFor[T]()
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	pl, err := planFor(t)
+	if err != nil {
+		return nil, err
+	}
+	return &ValueDecoder[T]{plan: pl}, nil
+}
+
+// Unmarshal decodes data into v, reusing this decoder's plan and scratch.
+func (d *ValueDecoder[T]) Unmarshal(data []byte, v *T) error {
+	return unmarshalWith(data, v, false, d.plan, &d.scratch)
+}
+
+// UnmarshalNoCopy decodes data into v with strings (and []byte values inside
+// interfaces) borrowed from data. They remain valid only while data remains
+// reachable and unmodified. This decoder remains single-goroutine only.
+func (d *ValueDecoder[T]) UnmarshalNoCopy(data []byte, v *T) error {
+	return unmarshalWith(data, v, true, d.plan, &d.scratch)
+}
+
 func unmarshal(data []byte, v any, alias bool) error {
+	return unmarshalWith(data, v, alias, nil, nil)
+}
+
+func unmarshalWith(data []byte, v any, alias bool, fixedPlan *plan, scratch *decScratch) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return ErrNeedPointer
@@ -85,15 +123,23 @@ func unmarshal(data []byte, v any, alias bool) error {
 		}
 		rv = rv.Elem()
 	}
-	pl, err := planFor(rv.Type().Elem())
-	if err != nil {
-		return err
+	pl := fixedPlan
+	var err error
+	if pl == nil {
+		pl, err = planFor(rv.Type().Elem())
+		if err != nil {
+			return err
+		}
 	}
 	pl, body, err := openMessage(data, rv.Type().Elem(), pl)
 	if err != nil {
 		return err
 	}
-	sc := decScratchPool.Get().(*decScratch)
+	pooled := scratch == nil
+	if pooled {
+		scratch = decScratchPool.Get().(*decScratch)
+	}
+	sc := scratch
 	// Decoded string bytes cannot exceed the input size; cap the initial arena
 	// so a single large message does not force one oversized allocation.
 	chunk := min(max(len(data)/2, 512), 16<<10)
@@ -114,7 +160,9 @@ func unmarshal(data []byte, v any, alias bool) error {
 		sc.strs = nil
 	}
 	sc.maps = d.maps
-	decScratchPool.Put(sc)
+	if pooled {
+		decScratchPool.Put(sc)
+	}
 	return err
 }
 
@@ -279,7 +327,7 @@ func openMessage(data []byte, t reflect.Type, pl *plan) (*plan, []byte, error) {
 		}
 		return pl, data[headerLen:], nil
 	}
-	if rest := data[headerLen:]; len(rest) >= len(pl.shape) && string(rest[:len(pl.shape)]) == string(pl.shape) {
+	if rest := data[headerLen:]; len(rest) >= len(pl.shape) && bytes.Equal(rest[:len(pl.shape)], pl.shape) {
 		// the writer had exactly this schema: no parsing, no derived plan
 		if fp != pl.fp {
 			return nil, nil, fmt.Errorf("%w: the fields the message has do not match this type's first fields (fields may only be added at the end of a struct)", ErrSchemaMismatch)

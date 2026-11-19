@@ -39,7 +39,9 @@ func main() {
 	// atomic multi-key change: all or nothing, even across a crash
 	b := db.NewBatch()
 	b.Put("acc:3", &Account{"cy", 5, nil})
-	b.Delete("acc:2")
+	if err := b.Delete("acc:2"); err != nil {
+		log.Fatal(err)
+	}
 	if err := b.Commit(); err != nil {
 		log.Fatal(err)
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -20,14 +21,17 @@ import (
 // Record: crc32c(4) | klen(4) | vlen+flags(4) | key | value. The CRC covers
 // everything after itself.
 const (
-	segMagic  = "STRATASG\x01"
-	mfMagic   = "STRATAMF\x01"
-	snapMagic = "STRATAIX\x01"
-	recHeader = 12
-	flagDel   = 1 << 31
-	flagMore  = 1 << 30 // record belongs to a batch that continues after it
-	lenMask   = flagMore - 1
-	maxKey    = 1 << 16
+	segMagic        = "STRATASG\x02"
+	segMagicV1      = "STRATASG\x01"
+	mfMagic         = "STRATAMF\x01"
+	snapMagic       = "STRATAIX\x02"
+	snapMagicV1     = "STRATAIX\x01"
+	recHeader       = 20 // v2 header; v1 segments use legacyRecHeader
+	legacyRecHeader = 12
+	flagDel         = 1 << 31
+	flagMore        = 1 << 30 // record belongs to a batch that continues after it
+	lenMask         = flagMore - 1
+	maxKey          = 1 << 16
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -36,32 +40,47 @@ func segPath(dir string, sid uint32) string { return filepath.Join(dir, fmt.Spri
 
 type rec struct {
 	off       int64 // start of the record in the segment
+	headerLen int
 	klen      uint32
 	vlen      uint32
+	expiresAt int64 // Unix nanoseconds; zero means no expiry
 	del, more bool
 	key       []byte // valid only during the callback
 }
 
-func (r *rec) size() int64         { return recHeader + int64(r.klen) + int64(r.vlen) }
-func (r *rec) voff() int64         { return r.off + recHeader + int64(r.klen) }
-func recSize(klen, vlen int) int64 { return recHeader + int64(klen) + int64(vlen) }
+func (r *rec) size() int64           { return int64(r.headerLen) + int64(r.klen) + int64(r.vlen) }
+func (r *rec) voff() int64           { return r.off + int64(r.headerLen) + int64(r.klen) }
+func recSize(klen, vlen int) int64   { return recHeader + int64(klen) + int64(vlen) }
+func recSizeV1(klen, vlen int) int64 { return legacyRecHeader + int64(klen) + int64(vlen) }
 
 // scanSegment reads records from start up to size, verifying each CRC. It
 // calls fn for every valid record and stops at the first invalid one (torn or
 // corrupt), returning the offset just past the last valid record.
 func scanSegment(f *os.File, start, size int64, fn func(r *rec) bool) int64 {
+	var magic [len(segMagic)]byte
+	if _, err := f.ReadAt(magic[:], 0); err != nil {
+		return start
+	}
+	headerLen := legacyRecHeader
+	v2 := string(magic[:]) == segMagic
+	if !v2 && string(magic[:]) != segMagicV1 {
+		return start
+	}
+	if v2 {
+		headerLen = recHeader
+	}
 	br := bufio.NewReaderSize(io.NewSectionReader(f, start, size-start), 1<<18)
 	off := start
 	var hdr [recHeader]byte
 	var key []byte
 	for off < size {
-		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+		if _, err := io.ReadFull(br, hdr[:headerLen]); err != nil {
 			break
 		}
 		klen := binary.LittleEndian.Uint32(hdr[4:])
 		vf := binary.LittleEndian.Uint32(hdr[8:])
 		vlen := vf & lenMask
-		if klen > maxKey || int64(klen)+int64(vlen) > size-off-recHeader {
+		if klen > maxKey || int64(klen)+int64(vlen) > size-off-int64(headerLen) {
 			break
 		}
 		if cap(key) < int(klen) {
@@ -71,7 +90,7 @@ func scanSegment(f *os.File, start, size int64, fn func(r *rec) bool) int64 {
 		if _, err := io.ReadFull(br, key); err != nil {
 			break
 		}
-		h := crc32.Update(0, crcTable, hdr[4:])
+		h := crc32.Update(0, crcTable, hdr[4:headerLen])
 		h = crc32.Update(h, crcTable, key)
 		bad := false
 		for rem := int(vlen); rem > 0; { // stream the value through the CRC, no copy, no allocation
@@ -85,10 +104,13 @@ func scanSegment(f *os.File, start, size int64, fn func(r *rec) bool) int64 {
 			br.Discard(n)
 			rem -= n
 		}
-		if bad || h != binary.LittleEndian.Uint32(hdr[:]) {
+		if bad || h != binary.LittleEndian.Uint32(hdr[:4]) {
 			break
 		}
-		r := rec{off: off, klen: klen, vlen: vlen, del: vf&flagDel != 0, more: vf&flagMore != 0, key: key}
+		r := rec{off: off, headerLen: headerLen, klen: klen, vlen: vlen, del: vf&flagDel != 0, more: vf&flagMore != 0, key: key}
+		if v2 {
+			r.expiresAt = int64(binary.LittleEndian.Uint64(hdr[12:20]))
+		}
 		off += r.size()
 		if !fn(&r) {
 			break
@@ -99,6 +121,10 @@ func scanSegment(f *os.File, start, size int64, fn func(r *rec) bool) int64 {
 
 // appendRec appends one encoded record to dst.
 func appendRec[K ~string | ~[]byte](dst []byte, key K, val []byte, del, more bool) []byte {
+	return appendRecTTL(dst, key, val, del, more, 0)
+}
+
+func appendRecTTL[K ~string | ~[]byte](dst []byte, key K, val []byte, del, more bool, expiresAt int64) []byte {
 	start := len(dst)
 	dst = append(dst, make([]byte, recHeader)...)
 	dst = append(dst, key...)
@@ -112,6 +138,7 @@ func appendRec[K ~string | ~[]byte](dst []byte, key K, val []byte, del, more boo
 	}
 	binary.LittleEndian.PutUint32(dst[start+4:], uint32(len(key)))
 	binary.LittleEndian.PutUint32(dst[start+8:], vf)
+	binary.LittleEndian.PutUint64(dst[start+12:], uint64(expiresAt))
 	binary.LittleEndian.PutUint32(dst[start:], crc32.Checksum(dst[start+4:], crcTable))
 	return dst
 }
@@ -223,6 +250,11 @@ type segState struct {
 	size, dead int64
 }
 
+type snapshotEntry struct {
+	key []byte
+	l   loc
+}
+
 func writeSnapshot(dir string, states []segState, t *tree) error {
 	return atomicWrite(dir, "INDEX", func(w io.Writer) error {
 		h := uint32(0)
@@ -251,9 +283,11 @@ func writeSnapshot(dir string, states []segState, t *tree) error {
 			if err = out(k); err != nil {
 				return false
 			}
-			uv(uint64(l.sid))
+			uv(uint64(l.seg.sid))
 			uv(uint64(l.off))
-			err = uv(uint64(l.vlen))
+			if err = uv(uint64(l.vlen)); err == nil {
+				err = uv(uint64(l.expiresAt))
+			}
 			return err == nil
 		})
 		if err != nil {
@@ -267,15 +301,16 @@ func writeSnapshot(dir string, states []segState, t *tree) error {
 }
 
 // readSnapshot loads INDEX. ok is false when it is missing or invalid.
-func readSnapshot(dir string) (states []segState, t *tree, ok bool) {
+func readSnapshot(dir string, segments map[uint32]*segment) (states []segState, t *tree, ok bool) {
 	b, err := os.ReadFile(filepath.Join(dir, "INDEX"))
-	if err != nil || len(b) < len(snapMagic)+4 || string(b[:len(snapMagic)]) != snapMagic {
+	if err != nil || len(b) < len(snapMagic)+4 || (string(b[:len(snapMagic)]) != snapMagic && string(b[:len(snapMagic)]) != snapMagicV1) {
 		return nil, nil, false
 	}
 	body := b[:len(b)-4]
 	if crc32.Checksum(body, crcTable) != binary.LittleEndian.Uint32(b[len(b)-4:]) {
 		return nil, nil, false
 	}
+	v2 := string(body[:len(snapMagic)]) == snapMagic
 	p := body[len(snapMagic):]
 	bad := false
 	uv := func() uint64 {
@@ -298,7 +333,7 @@ func readSnapshot(dir string) (states []segState, t *tree, ok bool) {
 	if bad || n > uint64(len(p)) { // every entry takes at least one byte
 		return nil, nil, false
 	}
-	t = &tree{}
+	entries := make([]snapshotEntry, 0, int(n))
 	for i := uint64(0); i < n && !bad; i++ {
 		kl := uv()
 		if bad || kl > maxKey || kl > uint64(len(p)) {
@@ -306,13 +341,27 @@ func readSnapshot(dir string) (states []segState, t *tree, ok bool) {
 		}
 		key := p[:kl]
 		p = p[kl:]
-		l := loc{uint32(uv()), uint32(uv()), uint32(uv())}
+		sid := uint32(uv())
+		seg := segments[sid]
+		l := loc{seg: seg, off: uint32(uv()), vlen: uint32(uv())}
+		if seg == nil {
+			bad = true
+		}
+		if v2 {
+			l.expiresAt = int64(uv())
+		}
 		if !bad {
-			t.set(key, l)
+			entries = append(entries, snapshotEntry{key: key, l: l})
 		}
 	}
 	if bad || len(p) != 0 {
 		return nil, nil, false
 	}
+	for i := 1; i < len(entries); i++ {
+		if bytes.Compare(entries[i-1].key, entries[i].key) >= 0 {
+			return nil, nil, false
+		}
+	}
+	t = buildSortedTree(entries)
 	return states, t, true
 }

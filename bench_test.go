@@ -47,6 +47,30 @@ func BenchmarkStrataUnmarshal(b *testing.B) {
 	}
 }
 
+func BenchmarkStrataUnmarshalNoCopy(b *testing.B) {
+	v := benchVal()
+	data, _ := MarshalEvolvable(&v)
+	var out Rich
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = UnmarshalNoCopy(data, &out)
+	}
+}
+
+func BenchmarkStrataValueDecoderNoCopy(b *testing.B) {
+	v := benchVal()
+	data, _ := MarshalEvolvable(&v)
+	d, err := NewValueDecoder[Rich]()
+	if err != nil {
+		b.Fatal(err)
+	}
+	var out Rich
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = d.UnmarshalNoCopy(data, &out)
+	}
+}
+
 func BenchmarkJSONMarshal(b *testing.B) {
 	v := benchVal()
 	b.ReportAllocs()

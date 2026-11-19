@@ -20,13 +20,27 @@ var ErrBadPattern = errors.New("store: malformed pattern")
 // visit keys under that prefix, so "user:42:*" touches only user 42's keys,
 // while "*:email" has no prefix and must examine every key.
 type glob struct {
-	pat    string
-	prefix []byte
-	exact  bool // no wildcards at all
+	prefix     []byte
+	tokens     []globToken
+	exact      bool // no wildcards at all
+	prefixOnly bool // the pattern is exactly the literal prefix followed by '*'
+}
+
+const (
+	globLiteral byte = iota
+	globStar
+	globAny
+	globClass
+)
+
+type globToken struct {
+	kind  byte
+	lit   byte
+	class *class
 }
 
 func compile(pattern string) (*glob, error) {
-	g := &glob{pat: pattern}
+	g := &glob{}
 	i := 0
 	for i < len(pattern) { // literal prefix
 		c := pattern[i]
@@ -44,20 +58,30 @@ func compile(pattern string) (*glob, error) {
 		i++
 	}
 	g.exact = i == len(pattern)
-	for j := i; j < len(pattern); { // validate the rest
+	g.prefixOnly = !g.exact && pattern[i:] == "*"
+	for j := 0; j < len(pattern); {
 		switch pattern[j] {
 		case '\\':
 			if j+1 >= len(pattern) {
 				return nil, ErrBadPattern
 			}
+			g.tokens = append(g.tokens, globToken{kind: globLiteral, lit: pattern[j+1]})
 			j += 2
+		case '*':
+			g.tokens = append(g.tokens, globToken{kind: globStar})
+			j++
+		case '?':
+			g.tokens = append(g.tokens, globToken{kind: globAny})
+			j++
 		case '[':
-			_, next, err := parseClass(pattern, j)
+			c, next, err := parseClass(pattern, j)
 			if err != nil {
 				return nil, err
 			}
+			g.tokens = append(g.tokens, globToken{kind: globClass, class: c})
 			j = next
 		default:
+			g.tokens = append(g.tokens, globToken{kind: globLiteral, lit: pattern[j]})
 			j++
 		}
 	}
@@ -132,37 +156,31 @@ func parseClass(pat string, i int) (*class, int, error) {
 // match reports whether key matches the pattern. It is linear in
 // len(key)*len(pattern) in the worst case and never exponential.
 func (g *glob) match(key []byte) bool {
-	pat := g.pat
+	tokens := g.tokens
 	p, i := 0, 0
 	starP, starI := -1, 0
 	for i < len(key) {
-		if p < len(pat) {
-			switch pat[p] {
-			case '*':
+		if p < len(tokens) {
+			tok := tokens[p]
+			switch tok.kind {
+			case globStar:
 				starP, starI = p, i
 				p++
 				continue
-			case '?':
+			case globAny:
 				_, w := utf8.DecodeRune(key[i:])
 				i += w
 				p++
 				continue
-			case '[':
-				c, next, _ := parseClass(pat, p)
+			case globClass:
 				r, w := utf8.DecodeRune(key[i:])
-				if c.matches(r) {
+				if tok.class.matches(r) {
 					i += w
-					p = next
-					continue
-				}
-			case '\\':
-				if p+1 < len(pat) && pat[p+1] == key[i] {
-					i++
-					p += 2
+					p++
 					continue
 				}
 			default:
-				if pat[p] == key[i] {
+				if tok.lit == key[i] {
 					i++
 					p++
 					continue
@@ -176,8 +194,8 @@ func (g *glob) match(key []byte) bool {
 		starI += w
 		i, p = starI, starP+1
 	}
-	for p < len(pat) && pat[p] == '*' {
+	for p < len(tokens) && tokens[p].kind == globStar {
 		p++
 	}
-	return p == len(pat)
+	return p == len(tokens)
 }

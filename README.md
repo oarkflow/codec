@@ -13,7 +13,7 @@ err = codec.Unmarshal(data, &user)         // no schema file, no code generation
 - **Readable too.** A line-based text notation with no braces, no indentation and no indexes to count, for `curl`, config files and debugging.
 - **Zero-copy reads.** Read one field out of a message without decoding it.
 - **Schema evolution.** Add fields to your structs without migrating data already written.
-- **Persistent store.** A typed, crash-safe key-value store with atomic batches, background compaction and wildcard queries.
+- **Persistent store.** A typed, crash-safe key-value store with expiry, temporary stores, atomic batches, bounded range reads/deletes, pagination, streaming and wildcard queries.
 - **No dependencies, no HTTP, no JSON.** The library imports only the standard library, and a test enforces that it never imports `encoding/json` or `net/http`.
 
 Module: `github.com/oarkflow/codec` (Go 1.27+). Tests, examples and benchmarks are in this repository.
@@ -100,6 +100,7 @@ The binary form is positional (fields are matched by order, not by name), so rea
 | `Append(dst []byte, v any) ([]byte, error)` | Like `Marshal`, appending to `dst`. Reuse a buffer (`buf[:0]`) and encoding allocates nothing. |
 | `Unmarshal(data []byte, v any) error` | Decodes into `v`, which must be a non-nil pointer. Strings and bytes are copied out of `data`. |
 | `UnmarshalNoCopy(data []byte, v any) error` | Like `Unmarshal`, but decoded strings (and `[]byte` inside `interface{}`) point into `data`. Zero allocations; you must not modify `data` while they are in use. |
+| `NewValueDecoder[T]()` | Creates a sequential decoder that reuses the schema plan and scratch state across `Unmarshal` or `UnmarshalNoCopy` calls. Not safe for concurrent use. |
 | `MarshalEvolvable` / `AppendEvolvable` | Like `Marshal`/`Append`, but readable by later versions of the type (see [section 5](#5-schema-evolution)). |
 
 ```go
@@ -410,7 +411,7 @@ db.Delete("user:1")
 A segmented log-structured store with an ordered in-memory index:
 
 - **Writes append** to the active segment file; nothing is rewritten in place. When a segment reaches `SegmentSize` a new one starts, so no file grows without bound.
-- **The index** is a compressed radix tree from key to the location of the latest value: 12 bytes per key plus shared key prefixes (about 93 bytes per key including key text, for a million keys). A `Get` is one tree lookup plus one `pread`. **Memory depends on the number of keys, not on how much value data you store.**
+- **The index** is a compressed radix tree from key to the location of the latest value: 24 bytes of location metadata per key (including expiry) plus shared key prefixes. A `Get` is one tree lookup plus a value read and decode. Segments use read-only memory mappings on supported Unix systems. Snapshot scans refresh the active segment mapping as it grows; appended bytes past the current mapping use file reads until the next refresh. Mapped pages are faulted in by the OS as needed, and the optional read cache has an explicit byte limit. The index itself scales with key count; stored values remain in the segment files.
 - **Ordered keys** make prefix and wildcard scans visit only the keys they need, in sorted order.
 - **Every record has a CRC.** A crash leaves at most a torn tail, which is cut off on reopen.
 - **Compaction** reclaims overwritten and deleted space in the background, a few segments at a time, without blocking readers or writers except for short moments.
@@ -424,14 +425,25 @@ Limits: keys up to 64 KiB, values up to 1 GiB, all keys must fit in RAM. A `DB` 
 |---|---|
 | `Open[T](dir, *Options)` | Opens or creates a store. Replays the log (or loads the checkpoint). |
 | `Put(key, *T)` | Stores a value, replacing any previous one. |
+| `PutTTL(key, *T, duration)` | Stores a value that becomes unavailable after the duration, starting after encoding; too-large durations return `store.ErrTTLTooLarge`. |
+| `PutUntil(key, *T, time)` | Stores a value until an absolute time; zero time means no expiry. Times outside the supported Unix-nanosecond range return `store.ErrExpiryRange`. |
+| `PutIfAbsent(key, *T)` | Atomically stores a value only when the key is missing or expired. |
+| `PutIfAbsentTTL(key, *T, duration)` | `PutIfAbsent` with expiry starting after encoding; too-large durations return `store.ErrTTLTooLarge`. |
+| `Expire(key, duration)` | Sets expiry on a live key without decoding or re-encoding its value; too-large durations return `store.ErrTTLTooLarge`. |
+| `Persist(key)` | Removes expiry from a live key. |
+| `RemainingTTL(key)` | Returns time until expiry; zero means the key has no expiry. |
 | `Get(key, *T)` | Decodes the value; `ErrNotFound` if missing. |
+| `GetBorrowed(key, fn)` | Decodes without copying strings (and byte slices inside interface values), then calls `fn` while holding a read lock. The value must not be retained, and `fn` must not call DB methods. |
+| `GetMany(keys)` | Reads keys in input order as bounded 256-key chunks, returning aligned values and found flags; missing or expired keys are not errors. Concurrent writes may be reflected between chunks. |
+| `GetManyBorrowed(keys, fn)` | Visits keys in order without allocating a result slice. The decoded `*T` is reused and its no-copy fields are valid only during the callback. The callback runs under a chunk read lock, so it must not call this DB or retain the value or its fields; return `false` to stop early. |
 | `Delete(key)` | Removes a key; `ErrNotFound` if missing. |
 | `Has(key)`, `Len()` | Existence and key count. |
-| `Update(key, fn)` | Atomic read-modify-write. `fn(v *T, exists bool) error` gets the current value (zero if absent). If `fn` returns nil the result is stored; an error writes nothing. No other write interleaves, so keep `fn` quick and do not call the `DB` from it. |
+| `Update(key, fn)` | Atomic read-modify-write. `fn(v *T, exists bool) error` gets the current value (zero if absent). If `fn` returns nil the result is stored; an error writes nothing. Existing expiry is preserved. No other write interleaves, so keep `fn` quick and do not call the `DB` from it. |
+| `UpdateTTL(key, duration, fn)` | Atomic read-modify-write that sets expiry after the updated value is encoded; a missing or expired key is created with that expiry. Too-large durations return `store.ErrTTLTooLarge`; a callback error writes nothing. |
 | `View(key, fn)` | Gives `fn` the raw encoded bytes (valid only during the call), for `codec.View` or `codec.UnmarshalNoCopy`. |
 | `NewBatch()` | Collects writes for atomic commit (below). |
 | `Sync()` | Flushes to stable storage. |
-| `Stats()` | `Keys`, `Segments`, `FileBytes`, `DeadBytes` (reclaimable). |
+| `Stats()` | `Keys`, `Segments`, `FileBytes`, `DeadBytes` (reclaimable), and read-cache bytes/entries. |
 | `Checkpoint()` | Saves the index now (also done on `Close`). Writers wait while it runs. |
 | `Compact()` | Reclaims dead space now. |
 | `Close()` | Stops background work, writes a checkpoint, closes files. |
@@ -441,11 +453,13 @@ Limits: keys up to 64 KiB, values up to 1 GiB, all keys must fit in RAM. A `DB` 
 ```go
 b := db.NewBatch()
 b.Put("acc:3", &Account{...})
-b.Delete("acc:2")
+_ = b.Delete("acc:2")
 err := b.Commit()   // one write: after a crash, all of it is visible or none of it
 ```
 
-`Batch` has `Put`, `Delete` (deleting a missing key is not an error), `Len` and `Commit`. A batch lives in one segment.
+`Batch` has `Put`, `PutTTL`, `PutUntil`, `Delete` (deleting a missing key is not an error), `Len`, `Reset` and `Commit`. Relative TTLs begin at `Commit`; expiry metadata is part of the same atomic commit as each value. A batch is limited to 1 GiB of encoded records and lives in one segment. Oversized keys or batches return `store.ErrTooLarge`; a failed `Commit` retains queued operations for retry, while `Reset` discards them.
+
+With `SyncAlways`, each successful `Put` or `Batch.Commit` waits for its write to reach durable storage. A batch amortizes that cost across all its records; durable-write latency depends strongly on batch size and the storage device.
 
 ### 9.4 Wildcard and pattern queries
 
@@ -471,24 +485,56 @@ Everything before the first wildcard is a literal prefix, and only keys under th
 |---|---|
 | `Match(pattern)` | Sorted matching keys. |
 | `Count(pattern)` | How many keys match, reading no values. |
-| `Keys()` | All keys, sorted. |
+| `Keys()` | All keys, sorted, in chunks that allow writers to proceed between pages. |
+| `KeysSnapshot()` | All live keys, sorted from one stable view; writers wait until the returned slice is collected. Repeated full owned snapshots can reuse the lazy key cache. |
 | `Scan(pattern, fn)` | Matching keys with decoded values, sorted. Return `false` to stop. The `*T` is reused between calls, so copy anything you keep. `fn` may call `DB` methods, including writes; the scan sees each value as of when it is reached and skips keys deleted meanwhile. |
 | `ScanKeys(pattern, fn)` | Matching keys without reading values. |
 | `ScanPrefix(prefix, fn)` | `Scan` for a literal prefix. |
 | `Range(fn)` | `Scan("*", fn)`. |
+| `ScanSnapshot(pattern, fn)` | Scans one stable index view while holding a read lock. The callback must not call DB methods; writers and compaction wait until it returns. |
+| `ScanSnapshotNoCopy(pattern, fn)` | Snapshot scan using `codec.UnmarshalNoCopy`; decoded fields are borrowed and valid only during the callback. Copy fields you retain. |
+| `ScanSnapshotBorrowed(pattern, fn)` | Snapshot scan with borrowed key bytes and no-copy decoded fields. Both are valid only during the callback; copy anything retained. |
+| `RangeSnapshot(fn)` | `ScanSnapshot("*", fn)`. |
+| `RangeSnapshotNoCopy(fn)` | `ScanSnapshotNoCopy("*", fn)`. |
+| `RangeSnapshotBorrowed(fn)` | `ScanSnapshotBorrowed("*", fn)`. |
+| `TakeRange(start, end, limit, fn)` | Visits up to `limit` live sorted keys in `[start, end)` in chunks of at most 256 keys or 8 MiB of encoded values (one larger value is allowed); empty `end` is unbounded. The callback runs outside the lock and may call DB methods. Its `*T` is reused; copy data you retain. |
+| `TakeRangeBorrowed(start, end, limit, fn)` | Bounded range scan with borrowed keys and no-copy values; the callback holds a read lock for up to 1024 keys and must not call DB methods or retain either argument. |
+| `DeleteRange(start, end, limit)` | Deletes up to `limit` live keys in `[start, end)` in atomic chunks without decoding values; empty `end` is unbounded. |
+| `TakeRangeSnapshotBorrowed(start, end, limit, fn)` | Bounded stable range with borrowed key bytes and no-copy values; callback must not call DB methods or retain either argument. |
+| `Page(pattern, after, limit)` | Returns a page of decoded entries and an exclusive cursor bound to the same pattern for the next page; changing patterns returns `store.ErrBadCursor`. |
+| `Stream(ctx, pattern)` | Streams sorted `Item[T]` values until exhausted or canceled. The channel buffers up to 256 items; each page is capped at 8 MiB of encoded values, except for one larger value. |
+| `StreamResults(ctx, pattern)` | Like `Stream`, with a terminal result carrying any scan error. |
+| `StreamBorrowed(ctx, pattern, fn)` | Visits sorted matches synchronously with borrowed keys and decoded fields in bounded chunks; callback data is valid only during the call, and the callback must not call the DB or retain borrowed data. Cancellation returns `ctx.Err()`. |
 | `DeleteMatch(pattern)` | Deletes every match in atomic batches of 1000; returns the count. |
 | `store.Escape(s)` | Quotes pattern metacharacters so `s` matches literally. |
 | `store.MatchKey(pattern, key)` | Tests one key against a pattern. |
 
-A malformed pattern returns `store.ErrBadPattern`. Scans work in chunks, so a long scan never blocks writers for long.
+A malformed pattern returns `store.ErrBadPattern`. `Scan`, `Range`, `TakeRange`, `TakeRangeBorrowed`, `DeleteRange`, and streaming work in chunks, so long scans yield regularly to writers. Concurrent writes can be reflected between chunks. `ScanSnapshot` holds a read lock for the full scan; use it when a stable view and maximum traversal throughput matter more than write latency.
+
+The first full `ScanSnapshot("*")`, `RangeSnapshot`, or `KeysSnapshot` uses the regular traversal. If another full owned snapshot is requested, that call lazily builds an ordered cache of stable key strings for reuse by later full snapshots. Inserts and deletes invalidate the cache, and the next full snapshot rebuilds it. The cache retains approximately one string header plus the key bytes per entry; borrowed snapshot scans avoid that retained cache.
+
+`OpenTemp[T](&Options{})` creates an isolated store whose directory is removed
+when `Close` returns. It is useful for caches and scratch data that should not
+survive the process. The temporary directory is still backed by the filesystem
+while the store is open.
+
+Expired entries behave as missing for `Get`, `Has`, scans, and `Len`. Expiry is
+stored in the checksummed record, survives reopen, and is preserved by
+compaction. A background worker appends tombstones after expiry so expired keys
+leave the index; compaction later reclaims their record bytes. Set
+`Options.ExpiryInterval` to adjust the cleanup cadence or a negative value to
+disable the worker.
 
 ### 9.5 Options
 
 ```go
 db, _ := store.Open[User]("./users", &store.Options{
 	SegmentSize:  64 << 20,           // default 64 MiB, at most 2 GiB
-	SyncAlways:   false,              // fsync every write (durable, much slower)
-	SyncInterval: time.Second,        // background fsync when SyncAlways is false
+	SyncAlways:   false,              // sync every write (durable, much slower)
+	SyncInterval: time.Second,        // background sync when SyncAlways is false
+	ExpiryInterval: time.Second,      // background removal of expired keys
+	ReadCacheBytes: 8 << 20,          // optional cache of recent Get values
+	StreamPageBytes: 8 << 20,         // encoded value bytes retained per stream page
 	CompactRatio: 0.5,                // compact segments that are >50% dead; negative disables
 	Strict:       false,              // true writes plain messages (see below)
 })
@@ -497,8 +543,11 @@ db, _ := store.Open[User]("./users", &store.Options{
 | Option | Default | Meaning |
 |---|---|---|
 | `SegmentSize` | 64 MiB | Size at which the active segment is closed. Smaller segments mean finer-grained compaction. |
-| `SyncAlways` | false | `fsync` after every write. Without it, data survives a process crash, but the last few writes can be lost on power failure unless you call `Sync`. |
-| `SyncInterval` | 0 | If positive (and `SyncAlways` is false), `fsync` in the background at this interval. |
+| `SyncAlways` | false | Forces each successful write to durable storage before return. Without it, data survives a process crash, but the last few writes can be lost on power failure unless you call `Sync`. |
+| `SyncInterval` | 0 | If positive (and `SyncAlways` is false), syncs writes in the background at this interval. |
+| `ExpiryInterval` | 1 s | How often the background worker removes expired keys; negative disables it. |
+| `ReadCacheBytes` | 0 | Maximum key and encoded-value bytes held in the optional FIFO `Get` read-through cache; zero disables it. This limit does not include map/list overhead. |
+| `StreamPageBytes` | 8 MiB | Maximum encoded value bytes retained per stream page; a single larger value is streamed alone. This limit does not include decoded object overhead. |
 | `CompactRatio` | 0.5 | Background compaction of segments whose dead bytes exceed this fraction. Negative disables automatic compaction (`Compact` still works). |
 | `Strict` | false | Write plain messages (one byte per struct type smaller) that only the exact same type can read. By default records are evolvable. |
 
@@ -526,7 +575,14 @@ NNNNNNNNNN.seg  segments: magic, then records, append-only
 INDEX           optional checkpoint of the key index
 ```
 
-A record is `crc32c | key length | value length + flags | key | value`. A checkpoint is ignored (and the log fully replayed) unless every segment it lists is still in the manifest and at least as long as recorded, so a stale or damaged checkpoint can never produce wrong data. Compaction writes new segments completely, swaps the manifest atomically, then deletes the old ones, so a crash at any point leaves a consistent store. Delete markers are kept unless a compaction run includes the oldest segment, so a deleted key can never reappear.
+A v1 record is `crc32c | key length | value length + flags | key | value`.
+A v2 record adds an absolute expiry timestamp to the header. Old segments and
+checkpoints remain readable; new writes use v2, and compaction writes v2
+segments. A checkpoint is ignored (and the log fully replayed) unless every
+segment it lists is still in the manifest and at least as long as recorded, so
+a stale or damaged checkpoint can never produce wrong data. Compaction writes
+new segments completely, swaps the manifest atomically, then deletes the old
+ones, so a crash at any point leaves a consistent store.
 
 See `examples/store`.
 
@@ -847,7 +903,8 @@ INDEX            optional checkpoint of the key index
 
 #### Segment and record
 
-A segment is the 9-byte magic `STRATASG\x01` followed by records:
+A v1 segment starts with `STRATASG\x01`; a v2 segment starts with
+`STRATASG\x02`. Both have a 9-byte magic. V1 records are:
 
 ```
 record = crc32c(4) klen(4) vflags(4) key value        all integers little-endian
@@ -857,6 +914,13 @@ record = crc32c(4) klen(4) vflags(4) key value        all integers little-endian
 - `crc32c` is CRC-32C (Castagnoli) over `klen`, `vflags`, `key` and `value`.
 - **Commit rule.** A record without `more` commits itself and every directly preceding record with `more`. A trailing run of `more` records with no closing record is **not committed** and is discarded: this is what makes a batch atomic. A batch is written with one write call and lives in one segment.
 - The value is a codec message (plain or evolvable) of the store's value type.
+
+V2 records add an `expires-at(8)` little-endian signed Unix-nanosecond timestamp
+between `vflags` and `key`. Zero means no expiry. The CRC covers `klen`,
+`vflags`, `expires-at`, `key` and `value`. New databases use v2; opening a v1
+database keeps its old segments readable and rotates to a v2 active segment.
+V2 checkpoints use `STRATAIX\x02` and append `uvarint(expires-at)` to each
+entry; v1 checkpoints remain supported.
 
 #### Manifest
 
@@ -869,8 +933,10 @@ All integers little-endian; the CRC covers everything before it. It lists the li
 #### Checkpoint
 
 ```
-index = "STRATAIX\x01" uvarint(nSegments) { uvarint(id) uvarint(size) uvarint(dead) }
-        uvarint(nEntries) { uvarint(klen) key uvarint(segment-id) uvarint(value-offset) uvarint(value-length) }
+index-v1 = "STRATAIX\x01" uvarint(nSegments) { uvarint(id) uvarint(size) uvarint(dead) }
+           uvarint(nEntries) { uvarint(klen) key uvarint(segment-id) uvarint(value-offset) uvarint(value-length) }
+index-v2 = "STRATAIX\x02" uvarint(nSegments) { uvarint(id) uvarint(size) uvarint(dead) }
+           uvarint(nEntries) { uvarint(klen) key uvarint(segment-id) uvarint(value-offset) uvarint(value-length) uvarint(expires-at) }
         crc32c(4)
 ```
 
@@ -891,7 +957,7 @@ Entries are in key order. The checkpoint is valid only if its CRC matches, every
 
 #### Durability
 
-Without `SyncAlways`, a process crash loses nothing that was written (the OS holds it), but a power failure can lose the most recent writes unless `Sync` was called or `SyncInterval` elapsed. With `SyncAlways`, every write is fsynced before it returns. Directory renames are made durable with a directory fsync.
+Without `SyncAlways`, a process crash loses nothing that was written (the OS holds it), but a power failure can lose the most recent writes unless `Sync` was called or `SyncInterval` elapsed. With `SyncAlways`, every write is synced to durable storage before it returns. Directory renames are made durable with a directory sync.
 
 ### 10.12 Pattern language
 
@@ -911,7 +977,7 @@ The **literal prefix** (everything before the first `*`, `?` or `[`, with escape
 
 ### 10.13 Versioning and compatibility rules
 
-- The marker byte (10.2) and the store magics (`STRATASG\x01`, `STRATAMF\x01`, `STRATAIX\x01`) carry the format version. Unknown values are rejected (`ErrBadHeader`, `ErrCorrupt`), so a change to the format can be introduced under a new value without being misread.
+- The marker byte (10.2) and store magics carry the format version. Segment and checkpoint v1 and v2 are supported; unknown values are rejected (`ErrBadHeader`, `ErrCorrupt`).
 - **Plain** messages are readable only by a schema with an identical fingerprint.
 - **Evolvable** messages are readable by any schema whose structs are the writer's with fields **appended** (10.2). Anything else is `ErrSchemaMismatch`.
 - A repeated struct type is referred to by position in the fingerprint, so renaming a Go type does not change it.
@@ -995,7 +1061,7 @@ Malformed or hostile input returns an error and never panics. The codec is fuzze
 | `codec.MaxMessageSize` | 256 MiB | Largest frame a `Decoder` will read. |
 | Evolved plans cached | 256 | Per process, so hostile headers cannot grow memory. |
 | Store key / value | 64 KiB / 1 GiB | `store.ErrTooLarge`. |
-| Store index | all keys in RAM | About 93 bytes per key. |
+| Store index | all keys in RAM | 24 bytes of location metadata per key, plus key text and radix-tree nodes. |
 
 Other things to know:
 

@@ -627,6 +627,7 @@ func benchScan(b *testing.B, pattern string, wantMin int) {
 
 func BenchmarkScanPrefix1M(b *testing.B) { benchScan(b, "user:0042:*", 10) }
 func BenchmarkScanMiddle1M(b *testing.B) { benchScan(b, "user:00?2:field3", 10) }
+func BenchmarkScanClass1M(b *testing.B)  { benchScan(b, "user:00[0-9]2:field3", 10) }
 func BenchmarkScanSuffix1M(b *testing.B) { benchScan(b, "*:field7", 100000) }
 
 type Order struct {
