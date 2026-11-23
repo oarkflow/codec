@@ -209,9 +209,8 @@ func atomicWrite(dir, name string, fill func(io.Writer) error) error {
 		os.Remove(tmp)
 		return err
 	}
-	if d, derr := os.Open(dir); derr == nil { // make the rename durable
-		d.Sync()
-		d.Close()
+	if err := syncDir(dir); err != nil {
+		return err
 	}
 	return nil
 }

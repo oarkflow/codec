@@ -2,7 +2,7 @@ package benchmarks
 
 import "fmt"
 
-// Plain Go types shared by Strata, JSON, gob, msgpack and CBOR.
+// Plain Go types shared by Codec, JSON, gob, MessagePack and CBOR.
 // They avoid constructs protobuf cannot express (nil elements in lists).
 
 type Addr struct {

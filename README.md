@@ -1,4 +1,4 @@
-# Strata
+# Codec
 
 A fast, compact binary codec for Go with a readable text form, zero-copy reads, schema evolution, and a persistent typed store with wildcard queries.
 
@@ -16,7 +16,7 @@ err = codec.Unmarshal(data, &user)         // no schema file, no code generation
 - **Persistent store.** A typed, crash-safe key-value store with expiry, temporary stores, atomic batches, bounded range reads/deletes, pagination, streaming and wildcard queries.
 - **No dependencies, no HTTP, no JSON.** The library imports only the standard library, and a test enforces that it never imports `encoding/json` or `net/http`.
 
-Module: `github.com/oarkflow/codec` (Go 1.27+). Tests, examples and benchmarks are in this repository.
+Module: `github.com/oarkflow/codec` (Go 1.27.3+). Linux, macOS and Windows are supported; Unix systems use read-only memory mappings for store segments, while other systems use file reads. Tests, examples and benchmarks are in this repository.
 
 **New here?** Run `go run ./examples/datatypes`: a guided tour of every supported data type and structure, each one round-tripped through all four formats, with its [own README](examples/datatypes/README.md). The formats themselves are defined in [section 10](#10-specification-formats-protocols-and-standards).
 
@@ -143,7 +143,7 @@ Not supported: channels, functions, complex numbers, and interfaces other than `
 | Error | Meaning |
 |---|---|
 | `ErrNeedPointer` | `Unmarshal` got a non-pointer or nil pointer. |
-| `ErrBadHeader` | The data is not a Strata message. |
+| `ErrBadHeader` | The data is not a Codec message. |
 | `ErrSchemaMismatch` | The message was written by a different type (see [section 5](#5-schema-evolution) for what is allowed). The text says whether the writer was newer. |
 | `ErrCorrupt` | Truncated or malformed data. Malformed input returns an error and never panics. |
 | `ErrTooDeep` | Nesting beyond 4,096 levels, or cyclic data. |
@@ -361,6 +361,9 @@ The library has no transport dependency. It provides plain functions over string
 | `FormatText` | `MediaText` | `text/x-strata` |
 | `FormatBase64` | `MediaBase64` | `application/x-strata+base64` |
 
+The `strata` media-type names are established wire-protocol identifiers and
+remain stable for compatibility; the library and packages are named Codec.
+
 ### 8.2 Functions
 
 | Function | What it does |
@@ -395,8 +398,9 @@ explicit JS/TS schemas. It reads Go messages, writes messages the Go decoder
 accepts, supports evolvable schemas, Base64 armor and Go's length-prefixed
 streams, and includes cross-language fixtures. Run `cd js && npm test` to build
 it and verify both directions. The package is currently source-only in this
-repository; custom Go marshalers and invalid UTF-8 Go strings require
-application-specific handling.
+repository and prepared for npm packaging; publishing is a separate release
+action. Its decoder bounds frames and estimated decoded memory. Custom Go
+marshalers and invalid UTF-8 Go strings require application-specific handling.
 
 ---
 
@@ -457,7 +461,7 @@ Limits: keys up to 64 KiB, values up to 1 GiB, all keys must fit in RAM. A `DB` 
 | `Stats()` | `Keys`, `Segments`, `FileBytes`, `DeadBytes` (reclaimable), and read-cache bytes/entries. |
 | `Checkpoint()` | Saves the index now (also done on `Close`). Writers wait while it runs. |
 | `Compact()` | Reclaims dead space now. |
-| `Close()` | Stops background work, writes a checkpoint, closes files. |
+| `Close()` | Stops background work, syncs the active segment, writes a checkpoint, closes files. |
 
 ### 9.3 Atomic batches
 
@@ -470,7 +474,7 @@ err := b.Commit()   // one write: after a crash, all of it is visible or none of
 
 `Batch` has `Put`, `PutTTL`, `PutUntil`, `Delete` (deleting a missing key is not an error), `Len`, `Reset` and `Commit`. Relative TTLs begin at `Commit`; expiry metadata is part of the same atomic commit as each value. A batch is limited to 1 GiB of encoded records and lives in one segment. Oversized keys or batches return `store.ErrTooLarge`; a failed `Commit` retains queued operations for retry, while `Reset` discards them.
 
-With `SyncAlways`, each successful `Put` or `Batch.Commit` waits for its write to reach durable storage. A batch amortizes that cost across all its records; durable-write latency depends strongly on batch size and the storage device.
+With `SyncAlways`, each successful `Put` or `Batch.Commit` waits for its write to reach durable storage. Otherwise, recent writes are synced by `Sync`, `SyncInterval`, or a successful `Close`. A batch amortizes sync cost across its records; durable-write latency depends strongly on batch size and the storage device.
 
 ### 9.4 Wildcard and pattern queries
 
@@ -554,7 +558,7 @@ db, _ := store.Open[User]("./users", &store.Options{
 | Option | Default | Meaning |
 |---|---|---|
 | `SegmentSize` | 64 MiB | Size at which the active segment is closed. Smaller segments mean finer-grained compaction. |
-| `SyncAlways` | false | Forces each successful write to durable storage before return. Without it, data survives a process crash, but the last few writes can be lost on power failure unless you call `Sync`. |
+| `SyncAlways` | false | Forces each successful write to durable storage before return. Without it, a process crash preserves writes held by the OS, while power loss can lose recent writes until `Sync`, `SyncInterval`, or successful `Close`. |
 | `SyncInterval` | 0 | If positive (and `SyncAlways` is false), syncs writes in the background at this interval. |
 | `ExpiryInterval` | 1 s | How often the background worker removes expired keys; negative disables it. |
 | `ReadCacheBytes` | 0 | Maximum key and encoded-value bytes held in the optional FIFO `Get` read-through cache; zero disables it. This limit does not include map/list overhead. |
@@ -939,7 +943,7 @@ entry; v1 checkpoints remain supported.
 manifest = "STRATAMF\x01" count(4) { segment-id(4) } next-id(4) crc32c(4)
 ```
 
-All integers little-endian; the CRC covers everything before it. It lists the live segments oldest first (the last is the active one) and the next unused id. It is replaced atomically: write `MANIFEST.tmp`, fsync, rename over `MANIFEST`, fsync the directory.
+All integers little-endian; the CRC covers everything before it. It lists the live segments oldest first (the last is the active one) and the next unused id. It is replaced atomically: write `MANIFEST.tmp`, fsync, rename over `MANIFEST`, then sync the directory on Unix. Non-Unix targets use the atomic rename but do not have a portable directory-flush operation in Go, so sudden-power-loss durability of directory metadata depends on the platform and filesystem.
 
 #### Checkpoint
 
@@ -968,7 +972,7 @@ Entries are in key order. The checkpoint is valid only if its CRC matches, every
 
 #### Durability
 
-Without `SyncAlways`, a process crash loses nothing that was written (the OS holds it), but a power failure can lose the most recent writes unless `Sync` was called or `SyncInterval` elapsed. With `SyncAlways`, every write is synced to durable storage before it returns. Directory renames are made durable with a directory sync.
+Without `SyncAlways`, a process crash loses nothing that was written (the OS holds it), but a power failure can lose the most recent writes unless `Sync`, `SyncInterval`, or a successful `Close` synced them. With `SyncAlways`, every write is synced to durable storage before it returns. Unix directory renames are synced; other targets rely on platform filesystem behavior for rename metadata durability.
 
 ### 10.12 Pattern language
 
@@ -1019,7 +1023,7 @@ Measured on an Apple M2 Pro, Go 1.27, 500 ms per benchmark. "doc" is one small r
 
 ### Speed (ns/op, allocations in brackets; lower is better)
 
-| | Strata | Protobuf | CBOR | MsgPack (shamaton) | MsgPack (vmihailenco) | JSON |
+| | Codec | Protobuf | CBOR | MsgPack (shamaton) | MsgPack (vmihailenco) | JSON |
 |---|---|---|---|---|---|---|
 | Encode doc | **363** (0) | 477 (0) | 570 (1) | 1,100 (17) | 1,305 (6) | 1,673 (1) |
 | Encode batch1000 | **46,220** (0) | 57,610 (0) | 57,380 (1) | 101,821 (7) | 128,375 (12) | 169,190 (1) |
@@ -1032,7 +1036,7 @@ With `UnmarshalNoCopy`, decoding the doc takes 396 ns with 0 allocations, and th
 
 ### Encoded size
 
-| | Strata | Protobuf | CBOR | MsgPack | JSON |
+| | Codec | Protobuf | CBOR | MsgPack | JSON |
 |---|---|---|---|---|---|
 | doc | **199 B** | 238 B | 357 B | 359-415 B | 481 B |
 | batch1000 | **1,604 B** | 28,083 B | 46,422 B | 46-49 KB | 58,885 B |
@@ -1076,6 +1080,7 @@ Malformed or hostile input returns an error and never panics. The codec is fuzze
 
 Other things to know:
 
+- The Go decoder limits are package-wide settings. Lower them before starting concurrent decodes; do not mutate them while codec calls are active. TypeScript limits can be set per decode call.
 - Decoded strings share memory blocks (a retained string keeps its block alive). With `UnmarshalNoCopy`, they point into your input buffer.
 - `Unmarshal` into an existing variable reuses its slices and maps; copy first if you hold earlier results.
 - Cyclic data, channels, functions, complex numbers and non-empty interfaces are not encodable.
@@ -1106,6 +1111,18 @@ Each is runnable with `go run ./examples/<name>`.
 ---
 
 ## 14. Testing
+
+The provider-neutral release checks are `./scripts/validate.sh` and
+`./scripts/benchmarks.sh`. The validation script runs the Go suite, race
+detector, vet, Go builds for Linux/macOS/Windows on amd64 and arm64, then the
+TypeScript tests and an npm package dry run. Bounded fuzzing is opt-in with
+`RUN_FUZZ=1` and should only run inside an isolated, resource-limited sandbox. It requires Go
+1.27.3+, Node.js 22+, npm, and a network connection or populated npm cache for
+`npm ci`. Set `FUZZTIME` to change each fuzz target's time budget. The
+benchmark script prints allocations and operation timings; compare repeated
+runs on the same machine and investigate changes over 10% before accepting a
+performance change. No application-specific SLA is implied by these synthetic
+baselines.
 
 ```
 go test ./...                       # everything

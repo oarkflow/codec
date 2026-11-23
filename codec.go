@@ -1,4 +1,4 @@
-// Package codec implements Strata, a compact binary codec whose Marshal and
+// Package codec implements Codec, a compact binary codec whose Marshal and
 // Unmarshal work like encoding/json: they accept any Go value (structs,
 // slices, arrays, maps, pointers, scalars, interface{}, time.Time and any type
 // with MarshalBinary/UnmarshalBinary or MarshalText/UnmarshalText) and need

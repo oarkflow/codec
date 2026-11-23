@@ -7,7 +7,8 @@ import (
 	"io"
 )
 
-// MaxMessageSize bounds the frame a Decoder will read.
+// MaxMessageSize bounds the frame a Decoder will read. Configure it before
+// starting concurrent decoding; do not mutate it while Decoder calls are active.
 var MaxMessageSize = 1 << 28
 
 // An Encoder writes a stream of values to an io.Writer, each prefixed with

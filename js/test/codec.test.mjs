@@ -114,6 +114,26 @@ test("base64 armor round-trips and schema mismatches fail clearly", () => {
   assert.throws(() => decode(t.struct({ Age: t.uint32 }), encode(schema, { Name: "Ada" })), CodecError);
 });
 
+test("decoder bounds message size and decoded allocations, including aggregate streams", () => {
+  const schema = t.struct({ ID: t.uint32 });
+  const message = encode(schema, { ID: 1 });
+  assert.throws(() => decode(schema, message, { maxAlloc: 1 }), /MaxAlloc/);
+  assert.throws(() => decode(schema, message, { maxMessageSize: message.length - 1 }), /MaxMessageSize/);
+  const stream = encodeStream(schema, [{ ID: 1 }, { ID: 2 }]);
+  assert.throws(() => decodeStream(schema, stream, MAX_SAFE_SIZE, 60), /MaxAlloc/);
+  assert.deepEqual(decodeStream(schema, stream), [{ ID: 1 }, { ID: 2 }]);
+  const scalarStream = encodeStream(t.int32, [1, 2]);
+  assert.throws(() => decodeStream(t.int32, scalarStream, MAX_SAFE_SIZE, 8), /MaxAlloc/);
+
+  const olderSchema = t.struct({ Name: t.string });
+  const currentSchema = t.struct({ Name: t.string, Extras: t.array(100, t.int32) });
+  const olderMessage = encode(olderSchema, { Name: "Ada" }, { evolvable: true });
+  assert.throws(() => decode(currentSchema, olderMessage, { maxAlloc: 100 }), /MaxAlloc/);
+  assert.equal(decode(currentSchema, olderMessage).Extras.length, 100);
+});
+
+const MAX_SAFE_SIZE = Number.MAX_SAFE_INTEGER;
+
 test("reads Go Encoder streams and writes streams Go Decoder can read", () => {
   const schema = t.struct({ ID: t.uint32, Name: t.string });
   const first = { ID: 1, Name: "Ada" }, second = { ID: 2, Name: "Grace" };

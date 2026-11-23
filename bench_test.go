@@ -16,10 +16,10 @@ func TestSizes(t *testing.T) {
 	j, _ := json.Marshal(&v)
 	var g bytes.Buffer
 	gob.NewEncoder(&g).Encode(&v)
-	t.Logf("strata=%dB json=%dB gob(first msg)=%dB", len(s), len(j), g.Len())
+	t.Logf("codec=%dB json=%dB gob(first msg)=%dB", len(s), len(j), g.Len())
 }
 
-func BenchmarkStrataMarshal(b *testing.B) {
+func BenchmarkCodecMarshal(b *testing.B) {
 	v := benchVal()
 	buf := make([]byte, 0, 1024)
 	b.ReportAllocs()
@@ -28,7 +28,7 @@ func BenchmarkStrataMarshal(b *testing.B) {
 	}
 }
 
-func BenchmarkStrataMarshalValue(b *testing.B) {
+func BenchmarkCodecMarshalValue(b *testing.B) {
 	v := benchVal()
 	buf := make([]byte, 0, 1024)
 	b.ReportAllocs()
@@ -37,7 +37,7 @@ func BenchmarkStrataMarshalValue(b *testing.B) {
 	}
 }
 
-func BenchmarkStrataUnmarshal(b *testing.B) {
+func BenchmarkCodecUnmarshal(b *testing.B) {
 	v := benchVal()
 	data, _ := Marshal(&v)
 	var out Rich
@@ -47,7 +47,22 @@ func BenchmarkStrataUnmarshal(b *testing.B) {
 	}
 }
 
-func BenchmarkStrataUnmarshalNoCopy(b *testing.B) {
+func BenchmarkMalformedDecode(b *testing.B) {
+	v := benchVal()
+	data, err := Marshal(&v)
+	if err != nil {
+		b.Fatal(err)
+	}
+	data[len(data)-1] ^= 0xff
+	var out Rich
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = Unmarshal(data, &out)
+	}
+}
+
+func BenchmarkCodecUnmarshalNoCopy(b *testing.B) {
 	v := benchVal()
 	data, _ := MarshalEvolvable(&v)
 	var out Rich
@@ -57,7 +72,7 @@ func BenchmarkStrataUnmarshalNoCopy(b *testing.B) {
 	}
 }
 
-func BenchmarkStrataValueDecoderNoCopy(b *testing.B) {
+func BenchmarkCodecValueDecoderNoCopy(b *testing.B) {
 	v := benchVal()
 	data, _ := MarshalEvolvable(&v)
 	d, err := NewValueDecoder[Rich]()
@@ -111,7 +126,7 @@ func BenchmarkGobRoundTrip(b *testing.B) { // streaming gob with warmed type inf
 
 func benchBatch() Table { return Table{"t", mkRows(1000, nil)} }
 
-func BenchmarkStrataBatchMarshal(b *testing.B) {
+func BenchmarkCodecBatchMarshal(b *testing.B) {
 	v := benchBatch()
 	buf := make([]byte, 0, 1<<16)
 	b.ReportAllocs()
@@ -120,7 +135,7 @@ func BenchmarkStrataBatchMarshal(b *testing.B) {
 	}
 }
 
-func BenchmarkStrataBatchUnmarshal(b *testing.B) {
+func BenchmarkCodecBatchUnmarshal(b *testing.B) {
 	v := benchBatch()
 	data, _ := Marshal(&v)
 	var out Table
@@ -151,7 +166,7 @@ func genericMapValue() genericMapBench {
 	return v
 }
 
-func BenchmarkStrataGenericMapUnmarshal(b *testing.B) {
+func BenchmarkCodecGenericMapUnmarshal(b *testing.B) {
 	in := genericMapValue()
 	data, _ := Marshal(&in)
 	var out genericMapBench
@@ -175,7 +190,7 @@ func BenchmarkJSONGenericMapUnmarshal(b *testing.B) {
 	}
 }
 
-func BenchmarkStrataDynamicBytesUnmarshal(b *testing.B) {
+func BenchmarkCodecDynamicBytesUnmarshal(b *testing.B) {
 	type payload struct{ Values map[string]any }
 	in := payload{Values: make(map[string]any, 32)}
 	for i := 0; i < 32; i++ {

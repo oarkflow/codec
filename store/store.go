@@ -1322,7 +1322,8 @@ func (db *DB[T]) ImportText(r io.Reader) error {
 	return b.Commit()
 }
 
-// Close stops background work, writes a checkpoint and closes all files.
+// Close stops background work, syncs appended records, writes a checkpoint and
+// closes all files.
 func (db *DB[T]) Close() error {
 	db.once.Do(func() { close(db.done) })
 	db.wg.Wait()
@@ -1331,7 +1332,12 @@ func (db *DB[T]) Close() error {
 	if db.closed {
 		return db.closeErr
 	}
-	err := db.checkpoint()
+	// Flush appended records before saving an index checkpoint that points to
+	// them. A failed sync must not leave a newer checkpoint claiming durability.
+	err := db.sync()
+	if err == nil {
+		err = db.checkpoint()
+	}
 	db.closed = true
 	for _, s := range db.segs {
 		s.unmap()

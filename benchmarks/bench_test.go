@@ -30,9 +30,9 @@ func cases[T any](v *T, pbMsg proto.Message, pbNew func() proto.Message) []tcase
 		pbOut = pbNew()
 	}
 	cs := []tcase{
-		{"strata", func(b []byte) ([]byte, error) { return codec.Append(b[:0], v) },
+		{"codec", func(b []byte) ([]byte, error) { return codec.Append(b[:0], v) },
 			func(d []byte) error { return codec.Unmarshal(d, out) }},
-		{"strata-nocopy", func(b []byte) ([]byte, error) { return codec.Append(b[:0], v) },
+		{"codec-nocopy", func(b []byte) ([]byte, error) { return codec.Append(b[:0], v) },
 			func(d []byte) error { return codec.UnmarshalNoCopy(d, out) }},
 		{"msgpack-vmihailenco", func([]byte) ([]byte, error) { return vmsgpack.Marshal(v) },
 			func(d []byte) error { return vmsgpack.Unmarshal(d, out) }},
@@ -65,7 +65,7 @@ func TestRoundTripAndSizes(t *testing.T) {
 	d, b := NewDoc(), NewBatch()
 	var gd Doc
 	var gb Batch
-	// Strata must round-trip both workloads exactly.
+	// Codec must round-trip both workloads exactly.
 	for _, c := range []struct {
 		in  any
 		out any
@@ -78,7 +78,7 @@ func TestRoundTripAndSizes(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(c.in, c.out) {
-			t.Fatalf("strata round trip mismatch for %T", c.in)
+			t.Fatalf("Codec round trip mismatch for %T", c.in)
 		}
 	}
 	ws := allWorkloads()

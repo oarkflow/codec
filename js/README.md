@@ -2,12 +2,12 @@
 
 This directory contains a runtime-dependency-free TypeScript implementation of the
 Codec binary message format. It uses explicit schemas so JS/TS can read and
-write the same bytes as Go. It is an in-repository package and is not yet
-published to npm. To install it from a local checkout:
+write the same bytes as Go. It is prepared as an in-repository npm package; publishing
+is a separate release action. To install it from a local checkout:
 
 ```sh
 cd js
-npm install
+npm ci
 npm run build
 # in the consuming application's directory:
 npm install /path/to/codec/js
@@ -98,6 +98,11 @@ once, including recursive references.
 - `decode(schema, bytes)` validates the fingerprint and returns the decoded
   value. Evolvable messages written by a schema with fewer trailing fields are
   accepted and newly added fields are zero-valued.
+- Decoding is bounded by `MAX_MESSAGE_SIZE` (256 MiB), `MAX_ELEMENTS`
+  (16,777,216 columnar elements), and `MAX_ALLOC` (256 MiB estimated decoded
+  memory). Pass `{ maxAlloc, maxMessageSize }` as the third argument to
+  `decode`, or the fourth argument to `decodeStream`, to lower per-call limits.
+  A stream shares one allocation budget across all its messages.
 - `encodeStream(schema, values, options)` and `decodeStream(schema, bytes)`
   interoperate with Go's uvarint-length-prefixed `Encoder` and `Decoder`.
 - `encodeBase64` and `decodeBase64` handle URL-safe unpadded armor.

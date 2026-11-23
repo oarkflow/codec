@@ -57,6 +57,8 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 export const MAX_ELEMENTS = 1 << 24;
 export const MAX_MESSAGE_SIZE = 1 << 28;
+/** Approximate maximum decoded memory budget for one message or stream. */
+export const MAX_ALLOC = 1 << 28;
 
 function scalarInfo(t: ScalarType): { desc: string; bytes: number; cls: "bool" | "int" | "uint" | "float" | "string" | "dynamic"; bits: number } {
   switch (t.name) {
@@ -409,6 +411,25 @@ interface DecodeContext {
   info: SchemaInfo;
   limits?: number[];
   depth: number;
+  budget: AllocationBudget;
+}
+
+interface AllocationBudget { remaining: number; }
+
+function reserve(ctx: DecodeContext, bytes: number): void {
+  reserveBudget(ctx.budget, bytes);
+}
+
+function reserveBudget(budget: AllocationBudget, bytes: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > budget.remaining) {
+    throw new CodecError("decoded allocation exceeds MaxAlloc");
+  }
+  budget.remaining -= bytes;
+}
+
+function makeBudget(maxAlloc: number): AllocationBudget {
+  if (!Number.isSafeInteger(maxAlloc) || maxAlloc < 0) throw new CodecError("MaxAlloc must be a non-negative safe integer");
+  return { remaining: maxAlloc };
 }
 
 function defaultValue(t: CodecType): unknown {
@@ -427,6 +448,23 @@ function defaultValue(t: CodecType): unknown {
       return "";
     }
   }
+}
+
+// Account for schema-driven defaults too. Missing fields and zero-valued root
+// frames can otherwise allocate large fixed arrays without decoding any bytes.
+function defaultCost(t: CodecType): number {
+  switch (t.kind) {
+    case "struct": return 32 + Object.values(t.fields).reduce((n, field) => n + 16 + defaultCost(field), 0);
+    case "array": return t.length * (8 + defaultCost(t.element));
+    case "slice": return 8;
+    case "map": return 64;
+    case "scalar": return scalarInfo(t).cls === "string" ? 2 : 0;
+    case "pointer": return 0;
+  }
+}
+
+function reserveDefault(ctx: DecodeContext, t: CodecType, count = 1): void {
+  reserve(ctx, defaultCost(t) * count);
 }
 
 function readFloat(data: Uint8Array, pos: number, bits: number): number {
@@ -452,6 +490,8 @@ function decodeFrame(t: StructType, data: Uint8Array, ctx: DecodeContext): Recor
     const fields = Object.entries(t.fields);
     const bitmapBytes = Math.max(1, Math.ceil(nFields / 8));
     if (data.length < bitmapBytes) throw new CodecError("truncated struct frame");
+    reserve(ctx, 32 + fields.length * 16);
+    for (const [, field] of fields) reserveDefault(ctx, field);
     const out = Object.fromEntries(fields.map(([name, field]) => [name, defaultValue(field)]));
     let pos = bitmapBytes;
     const vars: { index: number; type: CodecType }[] = [];
@@ -498,8 +538,8 @@ function decodeValuePayload(t: CodecType, data: Uint8Array, ctx: DecodeContext):
             return integerValue(t, info.cls === "int" ? unzigzag(v) : v);
           }
           case "float": if (data.length !== info.bytes) throw new CodecError("invalid float payload"); return readFloat(data, 0, info.bits);
-          case "string": return decodeString(data);
-          case "dynamic": { const [v, end] = decodeDynamic(data, 0, 0); if (end !== data.length) throw new CodecError("trailing dynamic bytes"); return v; }
+          case "string": reserve(ctx, data.length * 2); return decodeString(data);
+          case "dynamic": { const [v, end] = decodeDynamic(data, 0, 0, ctx); if (end !== data.length) throw new CodecError("trailing dynamic bytes"); return v; }
         }
       }
       case "struct": return decodeFrame(t, data, ctx);
@@ -530,11 +570,13 @@ function decodeElements(t: CodecType, data: Uint8Array, ctx: DecodeContext): unk
     const info = scalarInfo(t);
     if (info.cls === "bool") {
       if (data.some((v) => v > 1)) throw new CodecError("invalid bool slice");
+      reserve(ctx, data.length * 8);
       return Array.from(data, (v) => v === 1);
     }
-    if (t.name === "uint8") return Array.from(data);
+    if (t.name === "uint8") { reserve(ctx, data.length * 8); return Array.from(data); }
     if (info.cls === "float") {
       if (data.length % info.bytes !== 0) throw new CodecError("invalid float slice length");
+      reserve(ctx, data.length / info.bytes * 8);
       const values: number[] = [];
       for (let pos = 0; pos < data.length; pos += info.bytes) values.push(readFloat(data, pos, info.bits));
       return values;
@@ -542,6 +584,7 @@ function decodeElements(t: CodecType, data: Uint8Array, ctx: DecodeContext): unk
     if (info.cls === "int" || info.cls === "uint") {
       const [countBig, start] = readUvarint(data, 0);
       if (countBig > BigInt(data.length - start)) throw new CodecError("integer slice count exceeds payload");
+      reserve(ctx, Number(countBig) * 8);
       const count = Number(countBig), values: unknown[] = [];
       let pos = start, prev = 0n;
       for (let i = 0; i < count; i++) {
@@ -562,6 +605,7 @@ function decodeElements(t: CodecType, data: Uint8Array, ctx: DecodeContext): unk
     return decodeColumns(t, count, data, pos, ctx);
   }
   if (count > Math.floor((data.length - pos) / ctx.width)) throw new CodecError("slice count exceeds offset table");
+  reserve(ctx, count * 8);
   const tableEnd = pos + count * ctx.width;
   const values: unknown[] = [];
   for (let i = 0; i < count; i++) {
@@ -574,7 +618,7 @@ function decodeElements(t: CodecType, data: Uint8Array, ctx: DecodeContext): unk
 }
 
 function decodeMap(t: MapType, data: Uint8Array, ctx: DecodeContext): unknown {
-  if (data.length === 0) return defaultValue(t);
+  if (data.length === 0) { reserveDefault(ctx, t); return defaultValue(t); }
   const [keyLen, pos] = readUvarint(data, 0);
   if (keyLen > BigInt(data.length - pos)) throw new CodecError("map key payload exceeds message");
   const keyEnd = pos + Number(keyLen);
@@ -583,6 +627,7 @@ function decodeMap(t: MapType, data: Uint8Array, ctx: DecodeContext): unknown {
   const values = decodeElements(t.value, data.subarray(keyEnd), ctx);
   if (keys.length !== values.length) throw new CodecError("map key/value count mismatch");
   const count = keys.length;
+  reserve(ctx, count * 64);
   if (t.key.kind === "scalar" && scalarInfo(t.key).cls === "string") {
     const out: Record<string, unknown> = Object.create(null);
     for (let i = 0; i < count; i++) out[String(keys[i])] = values[i];
@@ -612,6 +657,7 @@ function decodeColumns(t: StructType, count: number, data: Uint8Array, tableStar
     if (start < tableEnd || start > end || end > data.length) throw new CodecError("invalid column offset");
     spans.push([start, end]);
   }
+  reserveDefault(ctx, t, count);
   const rows = Array.from({ length: count }, () => defaultValue(t) as Record<string, unknown>);
   let hasData = false;
   for (let f = 0; f < fields.length; f++) {
@@ -626,20 +672,23 @@ function decodeColumns(t: StructType, count: number, data: Uint8Array, tableStar
 }
 
 function decodeLane(t: CodecType, count: number, lane: Uint8Array, ctx: DecodeContext): unknown[] {
-  if (lane.length === 0) return Array.from({ length: count }, () => defaultValue(t));
+  if (lane.length === 0) { reserveDefault(ctx, t, count); return Array.from({ length: count }, () => defaultValue(t)); }
   const tag = lane[0], b = lane.subarray(1);
   if (t.kind === "scalar") {
     const info = scalarInfo(t);
     if (info.cls === "bool") {
       if (tag !== 0 || b.length !== Math.ceil(count / 8)) throw new CodecError("invalid bool lane");
+      reserve(ctx, count * 8);
       return Array.from({ length: count }, (_, i) => (b[i >> 3] & (1 << (i & 7))) !== 0);
     }
     if (info.cls === "string") {
       if (tag === 0) {
+        reserve(ctx, count * 8);
         let pos = 0; const out: string[] = [];
         for (let i = 0; i < count; i++) {
           const [n, next] = readUvarint(b, pos); pos = next;
           if (n > BigInt(b.length - pos)) throw new CodecError("truncated string lane");
+          reserve(ctx, Number(n) * 2);
           out.push(decodeString(b.subarray(pos, pos + Number(n)))); pos += Number(n);
         }
         if (pos !== b.length) throw new CodecError("trailing string lane bytes");
@@ -648,14 +697,17 @@ function decodeLane(t: CodecType, count: number, lane: Uint8Array, ctx: DecodeCo
       if (tag === 3) {
         const [n, p0] = readUvarint(b, 0); let pos = p0; const dict: string[] = [];
         if (n === 0n || n > BigInt(b.length)) throw new CodecError("invalid string dictionary");
+        reserve(ctx, Number(n) * 8);
         for (let i = 0; i < Number(n); i++) {
           const [len, next] = readUvarint(b, pos); pos = next;
           if (len > BigInt(b.length - pos)) throw new CodecError("truncated string dictionary");
+          reserve(ctx, Number(len) * 2);
           dict.push(decodeString(b.subarray(pos, pos + Number(len)))); pos += Number(len);
         }
         if (pos >= b.length) throw new CodecError("missing string dictionary width");
         const width = b[pos++], packed = b.subarray(pos);
         if (width > 32 || packed.length !== Math.ceil(count * width / 8)) throw new CodecError("invalid string dictionary indexes");
+        reserve(ctx, count * 8 + dict.reduce((n, item) => n + (typeof item === "string" ? item.length * 2 : 0), 0));
         return Array.from({ length: count }, (_, i) => {
           const ix = Number(unpack(packed, i * width, width));
           if (ix >= dict.length) throw new CodecError("string dictionary index out of range");
@@ -664,16 +716,18 @@ function decodeLane(t: CodecType, count: number, lane: Uint8Array, ctx: DecodeCo
       }
       throw new CodecError("unsupported string lane tag");
     }
-    if (info.cls === "int" || info.cls === "uint") return decodeIntegerLane(t, count, tag, b);
+    if (info.cls === "int" || info.cls === "uint") return decodeIntegerLane(t, count, tag, b, ctx);
     if (info.cls === "float") {
       if (tag === 0) {
         if (b.length !== count * info.bytes) throw new CodecError("invalid float lane length");
+        reserve(ctx, count * 8);
         return Array.from({ length: count }, (_, i) => readFloat(b, i * info.bytes, info.bits));
       }
-      if (tag === 3) return decodeDictionaryLane(t, count, b);
+      if (tag === 3) return decodeDictionaryLane(t, count, b, ctx);
     }
   }
   if (tag !== 0 || b.length < 1 + count * ctx.width) throw new CodecError("invalid row lane");
+  reserve(ctx, count * 8);
   const tableEnd = 1 + count * ctx.width, values: unknown[] = [];
   for (let i = 0; i < count; i++) {
     const start = readOffset(lane, 1 + i * ctx.width, ctx.width);
@@ -684,7 +738,7 @@ function decodeLane(t: CodecType, count: number, lane: Uint8Array, ctx: DecodeCo
   return values;
 }
 
-function decodeIntegerLane(t: ScalarType, count: number, tag: number, b: Uint8Array): unknown[] {
+function decodeIntegerLane(t: ScalarType, count: number, tag: number, b: Uint8Array, ctx: DecodeContext): unknown[] {
   const info = scalarInfo(t), signed = info.cls === "int";
   if (tag === 1) {
     const [rawMin, p0] = readUvarint(b, 0);
@@ -692,9 +746,11 @@ function decodeIntegerLane(t: ScalarType, count: number, tag: number, b: Uint8Ar
     if (p >= b.length) throw new CodecError("truncated frame-of-reference lane");
     const min = signed ? unzigzag(rawMin) : rawMin, width = b[p++], packed = b.subarray(p);
     if (width > 64 || packed.length !== Math.ceil(count * width / 8)) throw new CodecError("invalid packed lane");
+    reserve(ctx, count * 8);
     return Array.from({ length: count }, (_, i) => integerValue(t, wrap64(min + unpack(packed, i * width, width))));
   }
   if (tag === 2) {
+    reserve(ctx, count * 8);
     const out: unknown[] = []; let pos = 0, prev = 0n;
     for (let i = 0; i < count; i++) { const [v, next] = readUvarint(b, pos); pos = next; prev = wrap64(prev + unzigzag(v)); out.push(integerValue(t, prev)); }
     if (pos !== b.length) throw new CodecError("trailing delta lane bytes");
@@ -715,17 +771,19 @@ function decodeIntegerLane(t: ScalarType, count: number, tag: number, b: Uint8Ar
       const cw = b[p2++], clen = Math.ceil(checkpoints * cw / 8);
       if (cw > 64 || p2 + clen !== b.length) throw new CodecError("invalid delta checkpoints");
     } else if (p2 !== b.length) throw new CodecError("trailing delta lane bytes");
+    reserve(ctx, count * 8);
     const out: unknown[] = [integerValue(t, current)];
     for (let i = 0; i < nDeltas; i++) { current = wrap64(current + dmin + unpack(packed, i * width, width)); out.push(integerValue(t, current)); }
     return out;
   }
-  if (tag === 3) return decodeDictionaryLane(t, count, b);
+  if (tag === 3) return decodeDictionaryLane(t, count, b, ctx);
   throw new CodecError("unsupported integer lane tag");
 }
 
-function decodeDictionaryLane(t: ScalarType, count: number, b: Uint8Array): unknown[] {
+function decodeDictionaryLane(t: ScalarType, count: number, b: Uint8Array, ctx: DecodeContext): unknown[] {
   const info = scalarInfo(t), [n, p0] = readUvarint(b, 0);
   if (n === 0n || n > BigInt(b.length)) throw new CodecError("invalid dictionary size");
+  reserve(ctx, Number(n) * 8);
   let pos = p0; const dict: unknown[] = [];
   for (let i = 0; i < Number(n); i++) {
     if (info.cls === "int" || info.cls === "uint") {
@@ -739,6 +797,7 @@ function decodeDictionaryLane(t: ScalarType, count: number, b: Uint8Array): unkn
   if (pos >= b.length) throw new CodecError("missing dictionary width");
   const width = b[pos++], packed = b.subarray(pos);
   if (width > 32 || packed.length !== Math.ceil(count * width / 8)) throw new CodecError("invalid dictionary indexes");
+  reserve(ctx, count * 8);
   return Array.from({ length: count }, (_, i) => {
     const ix = Number(unpack(packed, i * width, width));
     if (ix >= dict.length) throw new CodecError("dictionary index out of range");
@@ -746,7 +805,7 @@ function decodeDictionaryLane(t: ScalarType, count: number, b: Uint8Array): unkn
   });
 }
 
-function decodeDynamic(data: Uint8Array, pos: number, depth: number): [unknown, number] {
+function decodeDynamic(data: Uint8Array, pos: number, depth: number, ctx: DecodeContext): [unknown, number] {
   if (depth > 4096 || pos >= data.length) throw new CodecError("truncated or deeply nested dynamic value");
   const tag = data[pos++];
   if (tag === 0) return [null, pos];
@@ -754,6 +813,7 @@ function decodeDynamic(data: Uint8Array, pos: number, depth: number): [unknown, 
   if (tag === 2) return [true, pos];
   if (tag === 3 || tag === 4) {
     const [v, next] = readUvarint(data, pos);
+    reserve(ctx, 24);
     return [tag === 3 ? new GoInt64(unzigzag(v)) : new GoUint64(v), next];
   }
   if (tag === 5) return [readFloat(data, pos, 64), pos + 8];
@@ -761,27 +821,31 @@ function decodeDynamic(data: Uint8Array, pos: number, depth: number): [unknown, 
     const [len, next] = readUvarint(data, pos); pos = next;
     if (len > BigInt(data.length - pos)) throw new CodecError("truncated dynamic bytes");
     const b = data.subarray(pos, pos + Number(len));
+    reserve(ctx, Number(len) * (tag === 6 ? 2 : 1));
     return [tag === 6 ? decodeString(b) : new Uint8Array(b), pos + Number(len)];
   }
   if (tag === 8) {
     const [n, next] = readUvarint(data, pos); pos = next;
     if (n > BigInt(data.length - pos)) throw new CodecError("dynamic list count exceeds payload");
+    reserve(ctx, Number(n) * 8);
     const values: unknown[] = [];
-    for (let i = 0; i < Number(n); i++) { const [v, end] = decodeDynamic(data, pos, depth + 1); values.push(v); pos = end; }
+    for (let i = 0; i < Number(n); i++) { const [v, end] = decodeDynamic(data, pos, depth + 1, ctx); values.push(v); pos = end; }
     return [values, pos];
   }
   if (tag === 9 || tag === 10) {
     const [n, next] = readUvarint(data, pos); pos = next;
     if (n > BigInt(data.length - pos)) throw new CodecError("dynamic map count exceeds payload");
+    reserve(ctx, Number(n) * 64);
     const obj: Record<string, unknown> = Object.create(null), map = new Map<unknown, unknown>();
     for (let i = 0; i < Number(n); i++) {
       let key: unknown;
       if (tag === 9) {
         const [len, p] = readUvarint(data, pos); pos = p;
         if (len > BigInt(data.length - pos)) throw new CodecError("truncated dynamic map key");
+        reserve(ctx, Number(len) * 2);
         key = decodeString(data.subarray(pos, pos + Number(len))); pos += Number(len);
-      } else { const [k, p] = decodeDynamic(data, pos, depth + 1); key = k; pos = p; }
-      const [v, p] = decodeDynamic(data, pos, depth + 1); pos = p;
+      } else { const [k, p] = decodeDynamic(data, pos, depth + 1, ctx); key = k; pos = p; }
+      const [v, p] = decodeDynamic(data, pos, depth + 1, ctx); pos = p;
       if (tag === 9) obj[key as string] = v; else map.set(key, v);
     }
     return [tag === 9 ? obj : map, pos];
@@ -801,9 +865,8 @@ function parseShape(data: Uint8Array, pos: number): [number[], number] {
   return [fields, pos];
 }
 
-/** Decode a Go Codec message using an explicit schema. Evolvable messages may
- * have fewer trailing fields than the supplied schema; new fields are zeroed. */
-export function decode<T = unknown>(schema: CodecType, message: Uint8Array): T {
+function decodeWithBudget<T>(schema: CodecType, message: Uint8Array, budget: AllocationBudget, maxMessageSize: number): T {
+  if (message.length > maxMessageSize) throw new CodecError(`message of ${message.length} bytes exceeds MaxMessageSize`);
   if (message.length < 5 || (message[0] & 0xf8) !== 0xc0 || (message[0] & 3) > 2) throw new CodecError("bad message header");
   const widthCodeValue = message[0] & 3, width = widthCodeValue === 0 ? 1 : widthCodeValue === 1 ? 2 : 4;
   const fp = (message[1] | (message[2] << 8) | (message[3] << 16) | (message[4] << 24)) >>> 0;
@@ -813,21 +876,29 @@ export function decode<T = unknown>(schema: CodecType, message: Uint8Array): T {
     info = schemaInfo(schema, limits);
   }
   if (fp !== info.fingerprint) throw new CodecError("schema fingerprint mismatch");
-  const ctx: DecodeContext = { width, info, limits, depth: 0 };
+  const ctx: DecodeContext = { width, info, limits, depth: 0, budget };
   const body = message.subarray(pos);
   if (schema.kind === "struct") return decodeFrame(schema, body, ctx) as T;
-  const root = types.struct({ V: schema });
-  const rootInfo = schemaInfo(root);
   // The non-struct schema fingerprint includes W, while its virtual frame has
   // one struct field. Decode the value span directly from that frame.
   const [value] = decodeVirtualRoot(schema, body, ctx);
-  void rootInfo;
   return value as T;
+}
+
+/** Decode a Go Codec message using an explicit schema. Evolvable messages may
+ * have fewer trailing fields than the supplied schema; new fields are zeroed.
+ * `maxAlloc` is an approximate decoded-memory budget, shared by a whole stream. */
+export function decode<T = unknown>(schema: CodecType, message: Uint8Array, options: { maxAlloc?: number; maxMessageSize?: number } = {}): T {
+  const maxMessageSize = options.maxMessageSize ?? MAX_MESSAGE_SIZE;
+  if (!Number.isSafeInteger(maxMessageSize) || maxMessageSize < 0) throw new CodecError("MaxMessageSize must be a non-negative safe integer");
+  return decodeWithBudget<T>(schema, message, makeBudget(options.maxAlloc ?? MAX_ALLOC), maxMessageSize);
 }
 
 /** Decode a complete buffer of length-prefixed messages written by Go's
  * Encoder. A partial final prefix or message is reported as corruption. */
-export function decodeStream<T = unknown>(schema: CodecType, stream: Uint8Array, maxMessageSize = MAX_MESSAGE_SIZE): T[] {
+export function decodeStream<T = unknown>(schema: CodecType, stream: Uint8Array, maxMessageSize = MAX_MESSAGE_SIZE, maxAlloc = MAX_ALLOC): T[] {
+  if (!Number.isSafeInteger(maxMessageSize) || maxMessageSize < 0) throw new CodecError("MaxMessageSize must be a non-negative safe integer");
+  const budget = makeBudget(maxAlloc);
   const values: T[] = [];
   let pos = 0;
   while (pos < stream.length) {
@@ -835,7 +906,8 @@ export function decodeStream<T = unknown>(schema: CodecType, stream: Uint8Array,
     if (len > BigInt(maxMessageSize)) throw new CodecError(`stream message of ${len} bytes exceeds MaxMessageSize`);
     if (len > BigInt(stream.length - start)) throw new CodecError("truncated stream message");
     const end = start + Number(len);
-    values.push(decode<T>(schema, stream.subarray(start, end)));
+    reserveBudget(budget, 8);
+    values.push(decodeWithBudget<T>(schema, stream.subarray(start, end), budget, maxMessageSize));
     pos = end;
   }
   return values;
@@ -845,7 +917,7 @@ function decodeVirtualRoot(schema: CodecType, body: Uint8Array, ctx: DecodeConte
   const bitmapBytes = 1;
   if (body.length < bitmapBytes) throw new CodecError("truncated root frame");
   const present = (body[0] & 1) !== 0;
-  if (!present) return [defaultValue(schema), body.length];
+  if (!present) { reserveDefault(ctx, schema); return [defaultValue(schema), body.length]; }
   if (schema.kind === "scalar") {
     const info = scalarInfo(schema);
     if (info.cls === "bool") return [true, 1];

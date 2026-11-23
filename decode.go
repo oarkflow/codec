@@ -9,7 +9,9 @@ import (
 	"unsafe"
 )
 
-// MaxElements bounds the element count of a columnar slice. Columnar lanes
+// MaxElements bounds the element count of a columnar slice. Configure package
+// limits before starting concurrent decodes; do not mutate them while calls
+// are active. Columnar lanes
 // can describe very many elements in few bytes (a constant lane is a few
 // bytes), so without a cap a tiny hostile message could request a huge
 // allocation. Row-layout slices are bounded by the input length instead.

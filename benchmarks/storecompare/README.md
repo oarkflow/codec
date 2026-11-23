@@ -2,7 +2,7 @@
 
 This module compares single-key reads/overwrites, 1K-key batched reads and
 writes, and 50K-key lookups/prefix scans using the same typed payload and
-Strata codec encoding across Codec's typed store (including borrowed reads and
+Codec encoding across Codec's typed store (including borrowed reads and
 its optional read cache), Badger, bbolt, and an
 optional Redis service. Fixture creation,
 initial writes, and close are explicitly outside the timed section.
