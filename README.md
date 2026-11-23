@@ -1121,8 +1121,11 @@ TypeScript tests and an npm package dry run. Bounded fuzzing is opt-in with
 `npm ci`. Set `FUZZTIME` to change each fuzz target's time budget. The
 benchmark script prints allocations and operation timings; compare repeated
 runs on the same machine and investigate changes over 10% before accepting a
-performance change. No application-specific SLA is implied by these synthetic
-baselines.
+performance change. It prints a median-based Codec-versus-format ranking for
+each codec workload and runs the Badger/bbolt store comparisons; the captured
+comparison and workload caveats are in
+[`benchmarks/COMPARISON.md`](benchmarks/COMPARISON.md). No application-specific
+SLA is implied by these synthetic baselines.
 
 ```
 go test ./...                       # everything

@@ -61,7 +61,9 @@ two MessagePack libraries, JSON, Badger, and bbolt. On the captured synthetic
 workloads, Codec led all six wire-format cases, single-key writes, atomic 1K
 batches, prefix scans, and a 50K borrowed range. Badger led uncached point reads
 and owned 1K `GetMany`. These are local medians, not performance guarantees; the
-comparison script reruns the same bounded workloads.
+comparison script reruns the same bounded workloads and prints a per-workload
+median ranking for the wire-format results. The captured store table reports
+both wins and losses against Badger and bbolt.
 
 ## Remaining validation limits
 
